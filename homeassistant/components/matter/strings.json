@@ -771,6 +771,9 @@
     "credential_type_not_supported": {
       "message": "The lock does not support credential type `{credential_type}`."
     },
+    "dataset_missing_extpanid": {
+      "message": "The dataset does not contain an extended PAN ID, so devices cannot be told which network to join."
+    },
     "device_command_failed": {
       "message": "The device did not accept the request: {details}"
     },
@@ -791,6 +794,9 @@
     },
     "not_a_border_router": {
       "message": "The selected device is not a manageable Thread border router."
+    },
+    "not_a_thread_device": {
+      "message": "The selected device is not a migratable Thread Matter device."
     },
     "set_credential_failed": {
       "message": "Failed to set credential: lock returned status `{status}`."
@@ -873,6 +879,30 @@
     "import_wifi_credentials": {
       "name": "Import Wi-Fi credentials",
       "description": "Returns to the Wi-Fi credentials shared by the network's router and lifts the override left by Set Wi-Fi credentials."
+    },
+    "migrate_thread_device": {
+      "name": "Migrate device to Thread network",
+      "description": "Moves an already commissioned Thread Matter device onto another Thread network without re-commissioning it. The device's fail-safe protects the move: one that cannot reach the new network returns to its old one by itself.",
+      "fields": {
+        "device_id": {
+          "name": "Device",
+          "description": "The Thread Matter device to move."
+        },
+        "dataset": {
+          "name": "Dataset",
+          "description": "Thread operational dataset as TLVs in hex. Defaults to the preferred network from the Thread settings."
+        }
+      }
+    },
+    "migrate_thread_fleet": {
+      "name": "Migrate all devices to Thread network",
+      "description": "Moves every commissioned Thread Matter device onto another Thread network, one at a time. Devices already on the network are skipped, border routers are left alone, and end devices go before the routers they depend on. Running it again picks up any stragglers.",
+      "fields": {
+        "dataset": {
+          "name": "Dataset",
+          "description": "Thread operational dataset as TLVs in hex. Defaults to the preferred network from the Thread settings."
+        }
+      }
     },
     "open_commissioning_window": {
       "description": "Allows adding one of your devices to another Matter network by opening the commissioning window for this Matter device for 60 seconds.",

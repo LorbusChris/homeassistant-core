@@ -46,6 +46,14 @@ from .thread_border_router import (
     get_border_router_endpoints,
     get_pending_dataset_timestamp,
 )
+from .thread_migration import (
+    MIGRATION_ORDER,
+    async_migrate_device,
+    get_extended_pan_id,
+    get_routing_role,
+    get_thread_network_endpoint,
+    network_id_from_dataset,
+)
 from .wifi_credentials import (
     async_import_credentials,
     async_set_manual_credentials,
@@ -65,6 +73,8 @@ SERVICE_SET_WIFI_CREDENTIALS = "set_wifi_credentials"
 SERVICE_IMPORT_WIFI_CREDENTIALS = "import_wifi_credentials"
 SERVICE_PUSH_THREAD_DATASET = "push_thread_dataset"
 SERVICE_GET_THREAD_DATASET = "get_thread_dataset"
+SERVICE_MIGRATE_THREAD_DEVICE = "migrate_thread_device"
+SERVICE_MIGRATE_THREAD_FLEET = "migrate_thread_fleet"
 
 ATTR_DATASET = "dataset"
 
@@ -135,6 +145,138 @@ async def _async_import_wifi_credentials(call: ServiceCall) -> None:
         )
 
 
+async def _dataset_from_call(call: ServiceCall) -> bytes:
+    """Return the Thread dataset named by the call, or the preferred one."""
+    if dataset_hex := call.data.get(ATTR_DATASET):
+        try:
+            dataset = bytes.fromhex(dataset_hex)
+        except ValueError as err:
+            raise ServiceValidationError(
+                translation_domain=DOMAIN, translation_key="invalid_dataset"
+            ) from err
+        if not dataset:
+            raise ServiceValidationError(
+                translation_domain=DOMAIN, translation_key="invalid_dataset"
+            )
+        return dataset
+    preferred = await async_get_preferred_dataset(call.hass)
+    if preferred is None:
+        raise ServiceValidationError(
+            translation_domain=DOMAIN, translation_key="no_preferred_dataset"
+        )
+    return bytes.fromhex(preferred)
+
+
+def _resolve_thread_device(call: ServiceCall, matter: MatterAdapter) -> Any:
+    """Return the migratable Thread node the chosen device stands for.
+
+    Border routers are refused: they are the network, not a device on it,
+    and are managed through Push Thread network instead. So is picking a
+    bridged accessory of a hub, which must not reconfigure the hub.
+    """
+    device_id = call.data[ATTR_DEVICE_ID]
+    try:
+        node = node_from_ha_device_id(call.hass, device_id)
+    except MissingNode as err:
+        raise ServiceValidationError(
+            translation_domain=DOMAIN,
+            translation_key="invalid_device",
+            translation_placeholders={"device_id": device_id},
+        ) from err
+    if node is None:
+        raise ServiceValidationError(
+            translation_domain=DOMAIN,
+            translation_key="invalid_device",
+            translation_placeholders={"device_id": device_id},
+        )
+    endpoint = get_thread_network_endpoint(node)
+    if endpoint is None or get_border_router_endpoints(node):
+        raise ServiceValidationError(
+            translation_domain=DOMAIN, translation_key="not_a_thread_device"
+        )
+    device_entry = dr.async_get(call.hass).async_get(device_id)
+    assert device_entry is not None  # node resolution above already found it
+    server_info = matter.matter_client.server_info
+    device_identifiers = {
+        identifier[1]
+        for identifier in device_entry.identifiers
+        if identifier[0] == DOMAIN
+    }
+    if (
+        f"{ID_TYPE_DEVICE_ID}_{get_device_id(server_info, endpoint)}"
+        not in device_identifiers
+    ):
+        raise ServiceValidationError(
+            translation_domain=DOMAIN, translation_key="not_a_thread_device"
+        )
+    return node
+
+
+async def _async_migrate_thread_device(call: ServiceCall) -> dict[str, Any]:
+    """Move one commissioned Thread device onto another Thread network."""
+    matter = _get_matter(call)
+    node = _resolve_thread_device(call, matter)
+    dataset = await _dataset_from_call(call)
+    result = await async_migrate_device(matter.matter_client, node, dataset)
+    return {"result": result}
+
+
+async def _async_migrate_thread_fleet(call: ServiceCall) -> dict[str, Any]:
+    """Move every commissioned Thread device onto another Thread network.
+
+    Devices already on the network are skipped, border routers are left
+    alone, and end devices go before the routers they depend on. The action
+    is idempotent: running it again picks up the stragglers.
+    """
+    matter = _get_matter(call)
+    dataset = await _dataset_from_call(call)
+    target_id = network_id_from_dataset(dataset)
+
+    candidates = []
+    migrated: list[dict[str, Any]] = []
+    skipped: list[dict[str, Any]] = []
+    failed: list[dict[str, Any]] = []
+    for node in matter.matter_client.get_nodes():
+        endpoint = get_thread_network_endpoint(node)
+        if endpoint is None or get_border_router_endpoints(node):
+            continue
+        entry = {"name": node.name, "node_id": node.node_id}
+        old_pan = get_extended_pan_id(endpoint)
+        if old_pan is not None and old_pan.to_bytes(8, "big") == target_id:
+            skipped.append(entry)
+        elif not node.available:
+            failed.append({**entry, "reason": "offline"})
+        else:
+            candidates.append(
+                (MIGRATION_ORDER.get(get_routing_role(endpoint), 1), node)
+            )
+
+    candidates.sort(key=lambda item: (item[0], item[1].node_id))
+    total = len(candidates)
+    for index, (_, node) in enumerate(candidates, start=1):
+        entry = {"name": node.name, "node_id": node.node_id}
+        LOGGER.info(
+            "Migrating %s (node %s, %d of %d) to the new Thread network",
+            node.name,
+            node.node_id,
+            index,
+            total,
+        )
+        try:
+            result = await async_migrate_device(matter.matter_client, node, dataset)
+        except HomeAssistantError as err:
+            LOGGER.warning(
+                "Could not migrate %s (node %s): %s", node.name, node.node_id, err
+            )
+            failed.append({**entry, "reason": str(err)})
+        else:
+            if result == "migrated":
+                migrated.append(entry)
+            else:
+                skipped.append(entry)
+    return {"migrated": migrated, "skipped": skipped, "failed": failed}
+
+
 def _resolve_border_router(call: ServiceCall, matter: MatterAdapter) -> Any:
     """Return the border router endpoint the chosen device stands for.
 
@@ -191,24 +333,7 @@ async def _async_push_thread_dataset(call: ServiceCall) -> None:
     matter = _get_matter(call)
     endpoint = _resolve_border_router(call, matter)
 
-    if dataset_hex := call.data.get(ATTR_DATASET):
-        try:
-            dataset = bytes.fromhex(dataset_hex)
-        except ValueError as err:
-            raise ServiceValidationError(
-                translation_domain=DOMAIN, translation_key="invalid_dataset"
-            ) from err
-        if not dataset:
-            raise ServiceValidationError(
-                translation_domain=DOMAIN, translation_key="invalid_dataset"
-            )
-    else:
-        preferred = await async_get_preferred_dataset(call.hass)
-        if preferred is None:
-            raise ServiceValidationError(
-                translation_domain=DOMAIN, translation_key="no_preferred_dataset"
-            )
-        dataset = bytes.fromhex(preferred)
+    dataset = await _dataset_from_call(call)
 
     await async_push_dataset(matter.matter_client, endpoint, dataset)
 
@@ -277,6 +402,25 @@ def async_setup_services(hass: HomeAssistant) -> None:
         _async_get_thread_dataset,
         schema=vol.Schema({vol.Required(ATTR_DEVICE_ID): cv.string}),
         supports_response=SupportsResponse.ONLY,
+    )
+    hass.services.async_register(
+        DOMAIN,
+        SERVICE_MIGRATE_THREAD_DEVICE,
+        _async_migrate_thread_device,
+        schema=vol.Schema(
+            {
+                vol.Required(ATTR_DEVICE_ID): cv.string,
+                vol.Optional(ATTR_DATASET): cv.string,
+            }
+        ),
+        supports_response=SupportsResponse.OPTIONAL,
+    )
+    hass.services.async_register(
+        DOMAIN,
+        SERVICE_MIGRATE_THREAD_FLEET,
+        _async_migrate_thread_fleet,
+        schema=vol.Schema({vol.Optional(ATTR_DATASET): cv.string}),
+        supports_response=SupportsResponse.OPTIONAL,
     )
 
     service.async_register_platform_entity_service(
