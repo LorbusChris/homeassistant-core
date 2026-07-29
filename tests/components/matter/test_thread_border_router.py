@@ -76,12 +76,15 @@ async def test_dataset_imported_from_border_router(
     )
     await hass.async_block_till_done()
 
-    # The dataset is only reachable by command, not as an attribute.
-    assert matter_client.send_device_command.called
-    command = matter_client.send_device_command.call_args.kwargs["command"]
-    assert isinstance(
-        command,
-        clusters.ThreadBorderRouterManagement.Commands.GetActiveDatasetRequest,
+    # The dataset is only reachable by command, not as an attribute. A network
+    # manager also shares Wi-Fi credentials, so this is not the only command
+    # the node receives; look for it rather than assuming it came last.
+    assert any(
+        isinstance(
+            call.kwargs.get("command"),
+            clusters.ThreadBorderRouterManagement.Commands.GetActiveDatasetRequest,
+        )
+        for call in matter_client.send_device_command.call_args_list
     )
 
     store = await dataset_store.async_get_store(hass)

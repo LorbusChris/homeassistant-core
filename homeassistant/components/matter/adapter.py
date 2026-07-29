@@ -25,6 +25,12 @@ from .thread_border_router import (
     get_border_router_endpoints,
     get_extended_address,
 )
+from .wifi_credentials import (
+    async_import_credentials,
+    get_passphrase_surrogate,
+    get_passphrase_surrogate_path,
+    get_wifi_endpoints,
+)
 
 THREAD_DATASET_RETRY_DELAY = 30  # seconds
 
@@ -67,6 +73,9 @@ class MatterAdapter:
         ] = {}
         # pending NodeNotReady retries, one timer per endpoint
         self._thread_dataset_retries: dict[tuple[int, int], Callable[[], None]] = {}
+        # (node_id, endpoint_id) -> surrogate of the credentials last imported
+        self._wifi_credential_surrogates: dict[tuple[int, int], int | None] = {}
+        self._wifi_credential_subscriptions: set[tuple[int, int]] = set()
 
     def register_platform_handler(
         self, platform: Platform, add_entities: AddEntitiesCallback
@@ -221,6 +230,7 @@ class MatterAdapter:
         # setup failed are still read; the read runs in a background task, so
         # its errors surface on their own terms either way.
         self._schedule_thread_dataset_import(node)
+        self._schedule_wifi_credential_import(node)
 
     def _schedule_thread_dataset_import(self, node: MatterNode) -> None:
         """Import Thread datasets from any border router endpoints on this node.
@@ -253,6 +263,88 @@ class MatterAdapter:
                 self._import_thread_dataset(key, endpoint),
                 name=f"matter_thread_dataset_{node.node_id}_{endpoint.endpoint_id}",
             )
+
+    def _schedule_wifi_credential_import(self, node: MatterNode) -> None:
+        """Import Wi-Fi credentials shared by any network manager on this node.
+
+        Reading the passphrase needs an await and this runs from synchronous
+        callbacks, so the work is scheduled as a background task.
+        """
+        for endpoint in get_wifi_endpoints(node):
+            key = (node.node_id, endpoint.endpoint_id)
+            self._subscribe_wifi_credential_updates(node, endpoint)
+            surrogate = get_passphrase_surrogate(endpoint)
+            # _setup_node also runs on every node update; the surrogate exists
+            # so the privileged passphrase read only happens on a real change.
+            if key in self._wifi_credential_surrogates and (
+                self._wifi_credential_surrogates[key] == surrogate
+            ):
+                continue
+            self._wifi_credential_surrogates[key] = surrogate
+            self.config_entry.async_create_background_task(
+                self.hass,
+                self._import_wifi_credentials(key, endpoint),
+                name=f"matter_wifi_credentials_{node.node_id}_{endpoint.endpoint_id}",
+            )
+
+    async def _import_wifi_credentials(
+        self, key: tuple[int, int], endpoint: MatterEndpoint
+    ) -> None:
+        """Import the credentials, forgetting the surrogate when the read fails.
+
+        The surrogate is recorded before the read to deduplicate concurrent
+        triggers, but a failed read must not count as done, or a transient
+        error would suppress the import until the passphrase changes again.
+        """
+        try:
+            await async_import_credentials(self.matter_client, endpoint)
+        except NodeNotReady:
+            # The node is mid-resubscription after a restart; try again once
+            # things have settled.
+            self._wifi_credential_surrogates.pop(key, None)
+
+            @callback
+            def _retry(_now: Any) -> None:
+                try:
+                    node = self.matter_client.get_node(key[0])
+                except KeyError:
+                    return  # node removed meanwhile
+                self._schedule_wifi_credential_import(node)
+
+            async_call_later(self.hass, THREAD_DATASET_RETRY_DELAY, _retry)
+        except Exception:
+            self._wifi_credential_surrogates.pop(key, None)
+            raise
+
+    def _subscribe_wifi_credential_updates(
+        self, node: MatterNode, endpoint: MatterEndpoint
+    ) -> None:
+        """Re-import the credentials when the shared passphrase changes.
+
+        Node updates only happen on interviews, so a password changed on the
+        router would otherwise go unnoticed until the next interview or
+        restart.
+        """
+        key = (node.node_id, endpoint.endpoint_id)
+        if key in self._wifi_credential_subscriptions:
+            return
+        self._wifi_credential_subscriptions.add(key)
+
+        def surrogate_updated_callback(event: EventType, data: Any) -> None:
+            try:
+                updated_node = self.matter_client.get_node(node.node_id)
+            except KeyError:
+                return  # race condition
+            self._schedule_wifi_credential_import(updated_node)
+
+        self.config_entry.async_on_unload(
+            self.matter_client.subscribe_events(
+                callback=surrogate_updated_callback,
+                event_filter=EventType.ATTRIBUTE_UPDATED,
+                node_filter=node.node_id,
+                attr_path_filter=get_passphrase_surrogate_path(endpoint),
+            )
+        )
 
     async def _import_thread_dataset(
         self, key: tuple[int, int], endpoint: MatterEndpoint
