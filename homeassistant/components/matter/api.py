@@ -4,7 +4,8 @@ from collections.abc import Callable, Coroutine
 from functools import wraps
 from typing import Any, Concatenate
 
-from matter_server.client.models.node import MatterNode
+from chip.clusters import Objects as clusters
+from matter_server.client.models.node import MatterNode, NodeType
 from matter_server.common.errors import MatterError
 from matter_server.common.helpers.util import dataclass_to_dict
 import voluptuous as vol
@@ -17,6 +18,8 @@ from .adapter import MatterAdapter
 from .helpers import MissingNode, get_matter, node_from_ha_device_id
 
 ID = "id"
+
+ThreadRole = clusters.ThreadNetworkDiagnostics.Enums.RoutingRoleEnum
 TYPE = "type"
 DEVICE_ID = "device_id"
 
@@ -233,6 +236,24 @@ async def websocket_node_diagnostics(
 ) -> None:
     """Gather diagnostics for the given node."""
     result = await matter.matter_client.node_diagnostics(node_id=node.node_id)
+    if result.node_type == NodeType.UNKNOWN:
+        # The client only inspects endpoint 0, which leaves a device whose
+        # Thread role lives on another endpoint (a border router attached
+        # over ethernet, say) unclassified; its routing role says what it is.
+        role_map = {
+            ThreadRole.kSleepyEndDevice: NodeType.SLEEPY_END_DEVICE,
+            ThreadRole.kEndDevice: NodeType.END_DEVICE,
+            ThreadRole.kReed: NodeType.END_DEVICE,
+            ThreadRole.kRouter: NodeType.ROUTING_END_DEVICE,
+            ThreadRole.kLeader: NodeType.ROUTING_END_DEVICE,
+        }
+        for endpoint in node.endpoints.values():
+            role = endpoint.get_attribute_value(
+                None, clusters.ThreadNetworkDiagnostics.Attributes.RoutingRole
+            )
+            if role is not None and (node_type := role_map.get(role)):
+                result.node_type = node_type
+                break
     connection.send_result(msg[ID], dataclass_to_dict(result))
 
 

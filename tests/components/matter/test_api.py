@@ -23,6 +23,8 @@ from homeassistant.components.matter.const import DOMAIN
 from homeassistant.core import HomeAssistant
 from homeassistant.helpers import device_registry as dr
 
+from .common import setup_integration_with_node_fixture
+
 from tests.common import MockConfigEntry
 from tests.typing import WebSocketGenerator
 
@@ -465,3 +467,50 @@ async def test_interview_node(
 
     assert not msg["success"]
     assert msg["error"]["code"] == ERROR_NODE_NOT_FOUND
+
+
+async def test_node_diagnostics_thread_role_enrichment(
+    hass: HomeAssistant,
+    hass_ws_client: WebSocketGenerator,
+    matter_client: MagicMock,
+) -> None:
+    """An unclassified node is typed from its Thread routing role."""
+    node = await setup_integration_with_node_fixture(
+        hass,
+        "thread_border_router",
+        matter_client,
+        override_attributes={"1/53/1": 6},  # Leader
+    )
+    await hass.async_block_till_done()
+    device_registry = dr.async_get(hass)
+    entry = next(
+        device
+        for device in device_registry.devices.values()
+        if any(
+            i[0] == DOMAIN and f"-{node.node_id:016X}-" in i[1]
+            for i in device.identifiers
+        )
+    )
+
+    mock_diagnostics = NodeDiagnostics(
+        node_id=node.node_id,
+        network_type=NetworkType.ETHERNET,
+        node_type=NodeType.UNKNOWN,
+        network_name="br-lan",
+        ip_adresses=[],
+        mac_address=None,
+        available=True,
+        active_fabrics=[],
+        active_fabric_index=0,
+    )
+    matter_client.node_diagnostics = AsyncMock(return_value=mock_diagnostics)
+
+    ws_client = await hass_ws_client(hass)
+    await ws_client.send_json(
+        {ID: 1, TYPE: "matter/node_diagnostics", DEVICE_ID: entry.id}
+    )
+    msg = await ws_client.receive_json()
+
+    assert msg["success"]
+    # The fixture reports routing role Leader on its Thread endpoint.
+    assert msg["result"]["node_type"] == "routing_end_device"
