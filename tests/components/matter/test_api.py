@@ -163,6 +163,8 @@ async def test_set_wifi_credentials(
     assert matter_client.set_wifi_credentials.call_args == call(
         ssid="test_network", credentials="test_password"
     )
+    # Entering credentials by hand overrides any network manager's offer.
+    assert integration.options["wifi_credentials_source"] == "manual"
 
     matter_client.set_wifi_credentials.reset_mock()
     matter_client.set_wifi_credentials.side_effect = NodeCommissionFailed(

@@ -15,7 +15,14 @@ from homeassistant.helpers.entity_platform import AddEntitiesCallback
 from homeassistant.helpers.event import async_call_later
 from homeassistant.helpers.typing import UNDEFINED, UndefinedType
 
-from .const import DOMAIN, ID_TYPE_DEVICE_ID, ID_TYPE_SERIAL, LOGGER
+from .const import (
+    CONF_WIFI_CREDENTIALS_SOURCE,
+    DOMAIN,
+    ID_TYPE_DEVICE_ID,
+    ID_TYPE_SERIAL,
+    LOGGER,
+    WIFI_CREDENTIALS_SOURCE_MANUAL,
+)
 from .discovery import async_discover_entities
 from .helpers import MatterConfigEntry, get_device_endpoint, get_device_id
 from .thread_border_router import (
@@ -296,8 +303,25 @@ class MatterAdapter:
         triggers, but a failed read must not count as done, or a transient
         error would suppress the import until the passphrase changes again.
         """
+        if (
+            self.config_entry.options.get(CONF_WIFI_CREDENTIALS_SOURCE)
+            == WIFI_CREDENTIALS_SOURCE_MANUAL
+        ):
+            # The credentials were set by hand; the network manager's offer
+            # stands ignored until the import action lifts the override. The
+            # surrogate must not count as imported, or lifting the override
+            # would never pick this change up.
+            self._wifi_credential_surrogates.pop(key, None)
+            return
         try:
-            await async_import_credentials(self.matter_client, endpoint)
+            await async_import_credentials(
+                self.matter_client,
+                endpoint,
+                should_apply=lambda: (
+                    self.config_entry.options.get(CONF_WIFI_CREDENTIALS_SOURCE)
+                    != WIFI_CREDENTIALS_SOURCE_MANUAL
+                ),
+            )
         except NodeNotReady:
             # The node is mid-resubscription after a restart; try again once
             # things have settled.

@@ -15,6 +15,7 @@ from homeassistant.core import HomeAssistant, callback
 
 from .adapter import MatterAdapter
 from .helpers import MissingNode, get_matter, node_from_ha_device_id
+from .wifi_credentials import async_set_manual_credentials
 
 ID = "id"
 TYPE = "type"
@@ -208,8 +209,8 @@ async def websocket_set_wifi_credentials(
     matter: MatterAdapter,
 ) -> None:
     """Set WiFi credentials for a device."""
-    await matter.matter_client.set_wifi_credentials(
-        ssid=msg["network_name"], credentials=msg["password"]
+    await async_set_manual_credentials(
+        hass, matter, msg["network_name"], msg["password"]
     )
     connection.send_result(msg[ID])
 

@@ -139,6 +139,9 @@
       "cancel_boost": {
         "name": "Cancel boost"
       },
+      "import_wifi_credentials": {
+        "name": "Import Wi-Fi credentials"
+      },
       "pause": {
         "name": "[%key:common::action::pause%]"
       },
@@ -762,11 +765,20 @@
     "credential_type_not_supported": {
       "message": "The lock does not support credential type `{credential_type}`."
     },
+    "device_command_failed": {
+      "message": "The device did not accept the request: {details}"
+    },
     "invalid_credential_data": {
       "message": "Invalid credential data: {reason}."
     },
+    "matter_not_set_up": {
+      "message": "The Matter integration is not set up."
+    },
     "set_credential_failed": {
       "message": "Failed to set credential: lock returned status `{status}`."
+    },
+    "wifi_import_failed": {
+      "message": "No network manager could be reached to import Wi-Fi credentials from."
     }
   },
   "issues": {
@@ -830,6 +842,10 @@
       "description": "Returns all users configured on a lock with their credentials.",
       "name": "Get lock users"
     },
+    "import_wifi_credentials": {
+      "name": "Import Wi-Fi credentials",
+      "description": "Returns to the Wi-Fi credentials shared by the network's router and lifts the override left by Set Wi-Fi credentials."
+    },
     "open_commissioning_window": {
       "description": "Allows adding one of your devices to another Matter network by opening the commissioning window for this Matter device for 60 seconds.",
       "fields": {
@@ -891,6 +907,20 @@
         }
       },
       "name": "Set lock user"
+    },
+    "set_wifi_credentials": {
+      "name": "Set Wi-Fi credentials",
+      "description": "Sets the Wi-Fi network that new Matter devices are put on during commissioning. This overrides the credentials shared by a router permanently; use Import Wi-Fi credentials to switch back.",
+      "fields": {
+        "ssid": {
+          "name": "Network name",
+          "description": "The SSID of the Wi-Fi network."
+        },
+        "password": {
+          "name": "Password",
+          "description": "The passphrase of the Wi-Fi network."
+        }
+      }
     },
     "water_heater_boost": {
       "description": "Enables water heater boost for a specific duration.",

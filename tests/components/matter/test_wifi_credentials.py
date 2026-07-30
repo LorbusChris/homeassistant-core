@@ -151,3 +151,61 @@ async def test_changed_surrogate_triggers_reimport(
     matter_client.set_wifi_credentials.assert_awaited_with(
         ssid=SSID, credentials=new_passphrase
     )
+
+
+async def test_set_wifi_credentials_action(
+    hass: HomeAssistant, matter_client: MagicMock
+) -> None:
+    """The action stores credentials for commissioning with the Matter server."""
+    await setup_integration_with_node_fixture(hass, "eve_contact_sensor", matter_client)
+    await hass.async_block_till_done()
+
+    await hass.services.async_call(
+        "matter",
+        "set_wifi_credentials",
+        {"ssid": "IoT", "password": "hunter2hunter2"},
+        blocking=True,
+    )
+
+    matter_client.set_wifi_credentials.assert_awaited_with(
+        ssid="IoT", credentials="hunter2hunter2"
+    )
+
+
+async def test_manual_credentials_stick_until_imported(
+    hass: HomeAssistant, matter_client: MagicMock, passphrase_response: dict[str, str]
+) -> None:
+    """A manual override survives passphrase changes until the import action."""
+    node = await setup_integration_with_node_fixture(
+        hass, "thread_border_router", matter_client
+    )
+    await hass.async_block_till_done()
+    assert passphrase_requests(matter_client) == 1
+
+    await hass.services.async_call(
+        "matter",
+        "set_wifi_credentials",
+        {"ssid": "IoT", "password": "hunter2hunter2"},
+        blocking=True,
+    )
+
+    # A changed passphrase on the router must no longer be picked up.
+    set_node_attribute(node, 1, 1105, SURROGATE_ATTRIBUTE, 1785200999999)
+    await trigger_subscription_callback(
+        hass,
+        matter_client,
+        EventType.ATTRIBUTE_UPDATED,
+        data=(node.node_id, "1/1105/1", 1785200999999),
+    )
+    await hass.async_block_till_done()
+    assert passphrase_requests(matter_client) == 1
+
+    # The import action lifts the override and reads the router again.
+    await hass.services.async_call(
+        "matter", "import_wifi_credentials", {}, blocking=True
+    )
+    await hass.async_block_till_done()
+    assert passphrase_requests(matter_client) == 2
+    matter_client.set_wifi_credentials.assert_awaited_with(
+        ssid=SSID, credentials=PASSPHRASE
+    )

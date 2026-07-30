@@ -5,6 +5,7 @@ from dataclasses import dataclass
 from typing import TYPE_CHECKING, Any, override
 
 from chip.clusters import Objects as clusters
+from matter_server.client.models import device_types
 from matter_server.common.custom_clusters import HeimanCluster
 
 from homeassistant.components.button import (
@@ -16,9 +17,11 @@ from homeassistant.const import EntityCategory, Platform
 from homeassistant.core import HomeAssistant
 from homeassistant.helpers.entity_platform import AddConfigEntryEntitiesCallback
 
+from .const import CONF_WIFI_CREDENTIALS_SOURCE
 from .entity import MatterEntity, MatterEntityDescription
-from .helpers import MatterConfigEntry
+from .helpers import MatterConfigEntry, get_matter
 from .models import MatterDiscoverySchema
+from .wifi_credentials import async_import_credentials
 
 
 async def async_setup_entry(
@@ -51,8 +54,38 @@ class MatterCommandButton(MatterEntity, ButtonEntity):
         await self.send_device_command(self.entity_description.command())
 
 
+class MatterImportWifiCredentialsButton(MatterEntity, ButtonEntity):
+    """Import the Wi-Fi credentials this network manager shares."""
+
+    entity_description: MatterButtonEntityDescription
+
+    @override
+    async def async_press(self) -> None:
+        """Lift any manual override and read this router's credentials."""
+        matter = get_matter(self.hass)
+        entry = matter.config_entry
+        if CONF_WIFI_CREDENTIALS_SOURCE in entry.options:
+            options = dict(entry.options)
+            options.pop(CONF_WIFI_CREDENTIALS_SOURCE)
+            self.hass.config_entries.async_update_entry(entry, options=options)
+        await async_import_credentials(self.matter_client, self._endpoint)
+
+
 # Discovery schema(s) to map Matter Attributes to HA entities
 DISCOVERY_SCHEMAS = [
+    MatterDiscoverySchema(
+        platform=Platform.BUTTON,
+        entity_description=MatterButtonEntityDescription(
+            key="ImportWifiCredentialsButton",
+            translation_key="import_wifi_credentials",
+            entity_category=EntityCategory.CONFIG,
+        ),
+        entity_class=MatterImportWifiCredentialsButton,
+        required_attributes=(clusters.WiFiNetworkManagement.Attributes.Ssid,),
+        device_type=(device_types.NetworkInfrastructureManager,),
+        # Null just means credential sharing is switched off right now.
+        allow_none_value=True,
+    ),
     MatterDiscoverySchema(
         platform=Platform.BUTTON,
         entity_description=MatterButtonEntityDescription(

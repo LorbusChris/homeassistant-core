@@ -10,6 +10,11 @@ ADDON_SLUG = "core_matter_server"
 CONF_INTEGRATION_CREATED_ADDON = "integration_created_addon"
 CONF_USE_ADDON = "use_addon"
 
+# When set to "manual", the Wi-Fi credentials were fixed with the
+# set_wifi_credentials action and network managers must not override them.
+CONF_WIFI_CREDENTIALS_SOURCE = "wifi_credentials_source"
+WIFI_CREDENTIALS_SOURCE_MANUAL = "manual"
+
 DOMAIN = "matter"
 LOGGER = logging.getLogger(__package__)
 

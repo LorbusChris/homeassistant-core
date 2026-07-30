@@ -1,20 +1,24 @@
 """Import Wi-Fi credentials shared by Matter network infrastructure managers."""
 
-from __future__ import annotations
-
 from base64 import b64decode
+from collections.abc import Callable
 from typing import TYPE_CHECKING, Any
 
 from chip.clusters import Objects as clusters
 from chip.clusters.Types import NullValue
 from matter_server.client.models import device_types
+from matter_server.common.errors import MatterError
 from matter_server.common.helpers.util import create_attribute_path
 
-from .const import LOGGER
+from .const import CONF_WIFI_CREDENTIALS_SOURCE, LOGGER, WIFI_CREDENTIALS_SOURCE_MANUAL
 
 if TYPE_CHECKING:
     from matter_server.client import MatterClient
     from matter_server.client.models.node import MatterEndpoint, MatterNode
+
+    from homeassistant.core import HomeAssistant
+
+    from .adapter import MatterAdapter
 
 
 # The cluster is part of the network infrastructure manager device type; a
@@ -92,7 +96,9 @@ def _passphrase_from_response(response: Any) -> bytes | None:
 
 
 async def async_import_credentials(
-    matter_client: MatterClient, endpoint: MatterEndpoint
+    matter_client: MatterClient,
+    endpoint: MatterEndpoint,
+    should_apply: Callable[[], bool] | None = None,
 ) -> None:
     """Store the Wi-Fi credentials this endpoint shares for commissioning.
 
@@ -125,6 +131,12 @@ async def async_import_credentials(
         )
         return
 
+    if should_apply is not None and not should_apply():
+        # The world changed while the passphrase was in flight — typically a
+        # manual override placed during the read. Applying now would clobber
+        # it with credentials from before the override.
+        return
+
     await matter_client.set_wifi_credentials(
         ssid=ssid.decode("utf-8", "replace"),
         credentials=passphrase.decode("utf-8", "replace"),
@@ -135,3 +147,36 @@ async def async_import_credentials(
         endpoint.node.node_id,
         endpoint.endpoint_id,
     )
+
+
+async def async_set_manual_credentials(
+    hass: HomeAssistant, matter: MatterAdapter, ssid: str, password: str
+) -> None:
+    """Store credentials entered by hand and make them stick.
+
+    Entering credentials is an explicit choice, so the automatic import
+    from network managers stands down until it is deliberately re-enabled.
+    The override is recorded before the credentials are stored, so an
+    import already in flight cannot slip in between and win.
+    """
+    entry = matter.config_entry
+    previous_options = dict(entry.options)
+    if (
+        entry.options.get(CONF_WIFI_CREDENTIALS_SOURCE)
+        != WIFI_CREDENTIALS_SOURCE_MANUAL
+    ):
+        hass.config_entries.async_update_entry(
+            entry,
+            options={
+                **entry.options,
+                CONF_WIFI_CREDENTIALS_SOURCE: WIFI_CREDENTIALS_SOURCE_MANUAL,
+            },
+        )
+    try:
+        await matter.matter_client.set_wifi_credentials(ssid=ssid, credentials=password)
+    except MatterError:
+        # Nothing was stored, so nothing is overridden. The error propagates
+        # unwrapped: the websocket API's error contract carries the Matter
+        # error code, and the service layer wraps it for its own audience.
+        hass.config_entries.async_update_entry(entry, options=previous_options)
+        raise
