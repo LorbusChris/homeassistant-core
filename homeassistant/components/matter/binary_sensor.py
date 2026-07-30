@@ -59,6 +59,15 @@ class MatterBinarySensor(MatterEntity, BinarySensorEntity):
         self._attr_is_on = value
 
 
+class MatterAbsentAsOffBinarySensor(MatterBinarySensor):
+    """Binary sensor for which a null reading means off, not unknown."""
+
+    def _update_from_device(self) -> None:
+        super()._update_from_device()
+        if self._attr_is_on is None:
+            self._attr_is_on = False
+
+
 _PUMP_STATUS = clusters.PumpConfigurationAndControl.Bitmaps.PumpStatusBitmap
 _VALVE_FAULT = clusters.ValveConfigurationAndControl.Bitmaps.ValveFaultBitmap
 
@@ -600,6 +609,23 @@ DISCOVERY_SCHEMAS = [
         required_attributes=(
             clusters.GeneralDiagnostics.Attributes.ActiveNetworkFaults,
         ),
+    ),
+    MatterDiscoverySchema(
+        platform=Platform.BINARY_SENSOR,
+        entity_description=MatterBinarySensorEntityDescription(
+            key="ThreadMigrationPending",
+            translation_key="thread_migration_pending",
+            device_class=BinarySensorDeviceClass.UPDATE,
+            entity_category=EntityCategory.DIAGNOSTIC,
+            # The timestamp is set while a migration is scheduled and cleared
+            # once the network has switched, so its presence is the state.
+            device_to_ha=lambda value: value is not None,
+        ),
+        entity_class=MatterAbsentAsOffBinarySensor,
+        required_attributes=(
+            clusters.ThreadBorderRouterManagement.Attributes.PendingDatasetTimestamp,
+        ),
+        allow_none_value=True,
     ),
     MatterDiscoverySchema(
         platform=Platform.BINARY_SENSOR,

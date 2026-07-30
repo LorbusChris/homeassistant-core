@@ -119,6 +119,9 @@
       "thermostat_remote_sensing_outdoor_temperature": {
         "name": "Outdoor temperature remote sensing"
       },
+      "thread_migration_pending": {
+        "name": "Thread migration pending"
+      },
       "valve_fault_blocked": {
         "name": "Valve blocked"
       },
@@ -136,6 +139,9 @@
       }
     },
     "button": {
+      "adopt_thread_network": {
+        "name": "Adopt preferred Thread network"
+      },
       "cancel_boost": {
         "name": "Cancel boost"
       },
@@ -771,8 +777,20 @@
     "invalid_credential_data": {
       "message": "Invalid credential data: {reason}."
     },
+    "invalid_dataset": {
+      "message": "The dataset must be Thread operational dataset TLVs in hex."
+    },
+    "invalid_device": {
+      "message": "Device {device_id} is not a Matter device."
+    },
     "matter_not_set_up": {
       "message": "The Matter integration is not set up."
+    },
+    "no_preferred_dataset": {
+      "message": "No dataset was given and no preferred Thread network is configured."
+    },
+    "not_a_border_router": {
+      "message": "The selected device is not a manageable Thread border router."
     },
     "set_credential_failed": {
       "message": "Failed to set credential: lock returned status `{status}`."
@@ -842,6 +860,16 @@
       "description": "Returns all users configured on a lock with their credentials.",
       "name": "Get lock users"
     },
+    "get_thread_dataset": {
+      "name": "Get Thread network from border router",
+      "description": "Reads a Matter border router's Thread network configuration: the active dataset, and the pending one while a migration is scheduled. The datasets contain the network key.",
+      "fields": {
+        "device_id": {
+          "name": "Border router",
+          "description": "The Matter border router device to read from."
+        }
+      }
+    },
     "import_wifi_credentials": {
       "name": "Import Wi-Fi credentials",
       "description": "Returns to the Wi-Fi credentials shared by the network's router and lifts the override left by Set Wi-Fi credentials."
@@ -855,6 +883,20 @@
         }
       },
       "name": "Open commissioning window"
+    },
+    "push_thread_dataset": {
+      "name": "Push Thread network to border router",
+      "description": "Hands a Thread network to a Matter border router. A border router without a network is adopted into it; one with a running network receives it as a pending migration.",
+      "fields": {
+        "device_id": {
+          "name": "Border router",
+          "description": "The Matter border router device to configure."
+        },
+        "dataset": {
+          "name": "Dataset",
+          "description": "Thread operational dataset as TLVs in hex. Defaults to the preferred network from the Thread settings."
+        }
+      }
     },
     "set_lock_credential": {
       "description": "Adds or updates a credential on a lock.",

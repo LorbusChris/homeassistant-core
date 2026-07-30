@@ -213,3 +213,25 @@ set_wifi_credentials:
           type: password
 
 import_wifi_credentials:
+
+push_thread_dataset:
+  fields:
+    device_id:
+      required: true
+      selector:
+        device:
+          filter:
+            - integration: matter
+    dataset:
+      required: false
+      selector:
+        text:
+
+get_thread_dataset:
+  fields:
+    device_id:
+      required: true
+      selector:
+        device:
+          filter:
+            - integration: matter

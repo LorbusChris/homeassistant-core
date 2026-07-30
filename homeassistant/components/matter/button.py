@@ -13,14 +13,17 @@ from homeassistant.components.button import (
     ButtonEntity,
     ButtonEntityDescription,
 )
+from homeassistant.components.thread import async_get_preferred_dataset
 from homeassistant.const import EntityCategory, Platform
 from homeassistant.core import HomeAssistant
+from homeassistant.exceptions import HomeAssistantError
 from homeassistant.helpers.entity_platform import AddConfigEntryEntitiesCallback
 
-from .const import CONF_WIFI_CREDENTIALS_SOURCE
+from .const import CONF_WIFI_CREDENTIALS_SOURCE, DOMAIN
 from .entity import MatterEntity, MatterEntityDescription
 from .helpers import MatterConfigEntry, get_matter
 from .models import MatterDiscoverySchema
+from .thread_border_router import async_push_dataset
 from .wifi_credentials import async_import_credentials
 
 
@@ -71,6 +74,24 @@ class MatterImportWifiCredentialsButton(MatterEntity, ButtonEntity):
         await async_import_credentials(self.matter_client, self._endpoint)
 
 
+class MatterAdoptThreadNetworkButton(MatterEntity, ButtonEntity):
+    """Hand the preferred Thread network to this border router."""
+
+    entity_description: MatterButtonEntityDescription
+
+    @override
+    async def async_press(self) -> None:
+        """Push the preferred dataset to the border router."""
+        preferred = await async_get_preferred_dataset(self.hass)
+        if preferred is None:
+            raise HomeAssistantError(
+                translation_domain=DOMAIN, translation_key="no_preferred_dataset"
+            )
+        await async_push_dataset(
+            self.matter_client, self._endpoint, bytes.fromhex(preferred)
+        )
+
+
 # Discovery schema(s) to map Matter Attributes to HA entities
 DISCOVERY_SCHEMAS = [
     MatterDiscoverySchema(
@@ -84,6 +105,23 @@ DISCOVERY_SCHEMAS = [
         required_attributes=(clusters.WiFiNetworkManagement.Attributes.Ssid,),
         device_type=(device_types.NetworkInfrastructureManager,),
         # Null just means credential sharing is switched off right now.
+        allow_none_value=True,
+    ),
+    MatterDiscoverySchema(
+        platform=Platform.BUTTON,
+        entity_description=MatterButtonEntityDescription(
+            key="AdoptThreadNetworkButton",
+            translation_key="adopt_thread_network",
+            entity_category=EntityCategory.CONFIG,
+            # Pressing this reconfigures a router's Thread network, so it
+            # must be enabled deliberately before it can be pressed at all.
+            entity_registry_enabled_default=False,
+        ),
+        entity_class=MatterAdoptThreadNetworkButton,
+        required_attributes=(
+            clusters.ThreadBorderRouterManagement.Attributes.ActiveDatasetTimestamp,
+        ),
+        # Null means unprovisioned, which is exactly when adoption applies.
         allow_none_value=True,
     ),
     MatterDiscoverySchema(
