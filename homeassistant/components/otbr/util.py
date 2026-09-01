@@ -459,6 +459,13 @@ class OTBRData:
         return await self.api.get_pending_dataset_tlvs()
 
     @_handle_otbr_error
+    async def get_pending_dataset_tlvs_with_etag(
+        self,
+    ) -> tuple[bytes, str | None] | None:
+        """Get the pending dataset TLVs with its entity tag, or None."""
+        return await self.api.get_pending_dataset_tlvs_with_etag()
+
+    @_handle_otbr_error
     async def create_active_dataset(
         self, dataset: python_otbr_api.ActiveDataSet
     ) -> None:
@@ -476,14 +483,28 @@ class OTBRData:
         await self.api.set_active_dataset_tlvs(dataset)
 
     @_handle_otbr_error
-    async def set_pending_dataset_tlvs(self, dataset: bytes) -> None:
+    async def set_pending_dataset_tlvs(
+        self, dataset: bytes, *, if_match: str | None = None
+    ) -> None:
         """Set the pending operational dataset in TLVS format.
 
-        Refused while a pending dataset is in place; a border router that
-        registers the dataset with the Thread leader (ot-br-posix#3582) can
-        also reject it, or report no verdict. The wrapper names each.
+        Refused while a pending dataset is in place, unless if_match names
+        the entity tag of exactly the dataset being replaced; a conditional
+        replace that lost its race is reported as such, since what the
+        caller asked to replace is gone rather than still propagating. A
+        border router that registers the dataset with the Thread leader
+        (ot-br-posix#3582) can also reject it, or report no verdict; the
+        wrapper names each.
         """
-        await self.api.set_pending_dataset_tlvs(dataset)
+        try:
+            await self.api.set_pending_dataset_tlvs(dataset, if_match=if_match)
+        except python_otbr_api.PendingDatasetConflictError as exc:
+            if if_match is None:
+                raise
+            raise HomeAssistantError(
+                translation_domain=DOMAIN,
+                translation_key="pending_dataset_changed",
+            ) from exc
 
     async def set_channel(
         self,
