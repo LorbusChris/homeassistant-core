@@ -76,6 +76,7 @@ def mock_pending_endpoint(
     aioclient_mock: AiohttpClientMocker,
     in_flight: str | None = None,
     put_status: HTTPStatus = HTTPStatus.CREATED,
+    etag: str | None = None,
 ) -> None:
     """Mock the router's pending-dataset endpoint."""
     aioclient_mock.clear_requests()
@@ -85,7 +86,11 @@ def mock_pending_endpoint(
             f"{BASE_URL}/node/dataset/pending", status=HTTPStatus.NO_CONTENT
         )
     else:
-        aioclient_mock.get(f"{BASE_URL}/node/dataset/pending", text=in_flight)
+        aioclient_mock.get(
+            f"{BASE_URL}/node/dataset/pending",
+            text=in_flight,
+            headers={"ETag": etag} if etag is not None else {},
+        )
     aioclient_mock.put(f"{BASE_URL}/node/dataset/pending", status=put_status)
 
 
@@ -287,7 +292,7 @@ async def test_migration_refuses_while_a_pending_dataset_is_in_flight(
     Superseding it would race the delay timer on every device already
     holding it, so a late replacement can split the mesh, and it would
     silently undo whatever that dataset was doing. Nothing is written and
-    nothing is recorded; the user is told to wait it out.
+    nothing is recorded; superseding it takes an explicit replace_pending.
     """
     mock_pending_endpoint(aioclient_mock, in_flight=TARGET)
 
@@ -467,6 +472,120 @@ async def test_a_lost_connection_keeps_the_migration_window(
         await call_migrate(hass, dataset=TARGET)
     assert exc_info.value.translation_key == "migration_in_flight"
     assert exc_info.value.translation_placeholders == {"remaining": "5"}
+
+
+async def test_replace_pending_writes_conditionally(
+    hass: HomeAssistant,
+    otbr_config_entry_multipan: str,
+    aioclient_mock: AiohttpClientMocker,
+) -> None:
+    """An explicit replace writes with If-Match on the tag that was read.
+
+    The condition pins the replacement to exactly the dataset the user saw,
+    and the write is stamped above it - the mesh is already counting down
+    on the higher-stamped in-flight dataset, and would silently ignore a
+    not-newer replacement while the action reported success.
+    """
+    in_flight = tlv_parser.encode_tlv(expected_pending(TARGET, 2000, 250000))
+    mock_pending_endpoint(aioclient_mock, in_flight=in_flight, etag='W/"9e4"')
+
+    response = await call_migrate(hass, dataset=TARGET, replace_pending=True)
+
+    assert response["status"] == "migrating"
+    puts = pending_calls(aioclient_mock)
+    assert len(puts) == 1
+    assert puts[0][3]["If-Match"] == 'W/"9e4"'
+    assert "If-None-Match" not in puts[0][3]
+    assert tlv_parser.parse_tlv(puts[0][2]) == expected_pending(TARGET, 2001, 300000)
+
+
+async def test_replace_pending_without_a_tag_is_refused(
+    hass: HomeAssistant,
+    otbr_config_entry_multipan: str,
+    aioclient_mock: AiohttpClientMocker,
+) -> None:
+    """A border router that hands out no entity tag cannot replace safely.
+
+    Without a tag the write cannot be made conditional, so on such a router
+    it would be unconditional - the very race replace_pending exists to
+    close. Refusing beats quietly degrading into that.
+    """
+    mock_pending_endpoint(aioclient_mock, in_flight=TARGET)
+
+    with pytest.raises(HomeAssistantError) as exc_info:
+        await call_migrate(hass, dataset=TARGET, replace_pending=True)
+
+    assert exc_info.value.translation_key == "replace_pending_unsupported"
+    assert not pending_calls(aioclient_mock)
+
+
+async def test_replace_pending_losing_the_race_is_surfaced(
+    hass: HomeAssistant,
+    otbr_config_entry_multipan: str,
+    aioclient_mock: AiohttpClientMocker,
+) -> None:
+    """A pending dataset changing under the replace refuses the write.
+
+    The router rejects the If-Match condition, and the refusal must surface
+    as its own error: what the user asked to replace is gone, so the answer
+    is to read the new state, not to retry as-is.
+    """
+    in_flight = tlv_parser.encode_tlv(expected_pending(TARGET, 2000, 250000))
+    mock_pending_endpoint(
+        aioclient_mock,
+        in_flight=in_flight,
+        etag='W/"9e4"',
+        put_status=HTTPStatus.PRECONDITION_FAILED,
+    )
+
+    with pytest.raises(HomeAssistantError) as exc_info:
+        await call_migrate(hass, dataset=TARGET, replace_pending=True)
+
+    assert exc_info.value.translation_key == "pending_dataset_changed"
+
+
+async def test_replace_pending_retargets_the_current_network(
+    hass: HomeAssistant,
+    otbr_config_entry_multipan: str,
+    aioclient_mock: AiohttpClientMocker,
+) -> None:
+    """An explicit replace can call a queued move off.
+
+    Re-targeting the network the router still runs is not "already on
+    network" while a move away is queued: the mesh is about to leave it,
+    and putting a newer-stamped counter dataset in the queue is the point.
+    """
+    mock_pending_endpoint(aioclient_mock, in_flight=TARGET, etag='W/"9e4"')
+
+    response = await call_migrate(
+        hass, dataset=DATASET_CH16.hex(), replace_pending=True
+    )
+
+    assert response["status"] == "migrating"
+    puts = pending_calls(aioclient_mock)
+    assert len(puts) == 1
+    assert puts[0][3]["If-Match"] == 'W/"9e4"'
+    # Stamped above the in-flight migration (ts 1003), not just the active
+    # network (ts 1).
+    assert tlv_parser.parse_tlv(puts[0][2]) == expected_pending(
+        DATASET_CH16.hex(), 1004, 300000
+    )
+
+
+async def test_replace_pending_with_nothing_in_flight_is_a_plain_migration(
+    hass: HomeAssistant,
+    otbr_config_entry_multipan: str,
+    aioclient_mock: AiohttpClientMocker,
+) -> None:
+    """With nothing to replace, the flag changes nothing about the write."""
+    mock_pending_endpoint(aioclient_mock)
+
+    response = await call_migrate(hass, dataset=TARGET, replace_pending=True)
+
+    assert response["status"] == "migrating"
+    puts = pending_calls(aioclient_mock)
+    assert puts[0][3].get("If-None-Match") == "*"
+    assert tlv_parser.parse_tlv(puts[0][2]) == expected_pending(TARGET, 1004, 300000)
 
 
 async def test_delay_is_applied(
@@ -676,8 +795,8 @@ async def test_targeting_the_current_network_also_refuses_while_pending(
     """With a move away queued, re-targeting the current network refuses too.
 
     It must not be swallowed as "already on network": the mesh is about to
-    leave it. But refusing is all this action can offer, since a counter
-    dataset would race the delay timers the same as any other replacement.
+    leave it. Calling the move off is a replacement like any other, so it
+    takes the same explicit replace_pending.
     """
     mock_pending_endpoint(aioclient_mock, in_flight=TARGET)
 
@@ -893,7 +1012,7 @@ async def test_migration_reports_a_discarded_store_write(
     )
 
     async def store_newer_dataset(
-        dataset: bytes, *, allow_replace: bool = False
+        dataset: bytes, *, if_match: str | None = None
     ) -> None:
         """Store newer credentials for the target network mid-migration."""
         interloper = dict(tlv_parser.parse_tlv(TARGET))

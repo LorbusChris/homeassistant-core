@@ -39,6 +39,9 @@
     "no_preferred_dataset": {
       "message": "No dataset was given and no preferred Thread network is configured."
     },
+    "pending_dataset_changed": {
+      "message": "The pending dataset changed while the replacement was being prepared: another controller got there first. Nothing was written; check the new state and run the action again if it is still wrong."
+    },
     "pending_dataset_in_place": {
       "message": "A pending dataset is already in place: a migration or channel change is propagating through the mesh. Wait for it to complete, then try again."
     },
@@ -47,6 +50,9 @@
     },
     "preferred_dataset_changed": {
       "message": "The preferred Thread network changed while the border router was being read, so nothing was migrated. Try again."
+    },
+    "replace_pending_unsupported": {
+      "message": "This border router cannot replace a pending dataset safely: it does not report entity tags, so the router could not check that what gets replaced is still what you saw. Update the border router, or wait for the pending change to complete."
     },
     "router_dataset_invalid": {
       "message": "The border router returned a dataset that could not be parsed or has no extended PAN ID."
@@ -84,6 +90,10 @@
         "delay": {
           "description": "How long devices wait before switching, giving sleepy devices time to hear about the change.",
           "name": "Delay"
+        },
+        "replace_pending": {
+          "description": "Replace a migration or channel change that is still propagating. The replacement races the delay timers of devices that already hold it, so a late replacement can leave part of the mesh on the old target; only use this to correct a change you just started.",
+          "name": "Replace pending change"
         }
       },
       "name": "Migrate Thread network"

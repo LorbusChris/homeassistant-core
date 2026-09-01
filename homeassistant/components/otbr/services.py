@@ -39,6 +39,7 @@ SERVICE_MIGRATE_NETWORK = "migrate_network"
 ATTR_CONFIG_ENTRY = "config_entry"
 ATTR_DATASET = "dataset"
 ATTR_DELAY = "delay"
+ATTR_REPLACE_PENDING = "replace_pending"
 
 # The delay recommended for a channel change; a network change needs the
 # same grace for sleepy devices to hear about it.
@@ -73,6 +74,7 @@ SERVICE_MIGRATE_NETWORK_SCHEMA = vol.Schema(
         vol.Optional(ATTR_DELAY, default=DEFAULT_DELAY_S): vol.All(
             vol.Coerce(int), vol.Range(min=30, max=3600)
         ),
+        vol.Optional(ATTR_REPLACE_PENDING, default=False): cv.boolean,
     }
 )
 
@@ -249,6 +251,7 @@ async def _write_pending_dataset(
     source_xpan: str,
     stamp: tuple[int, int],
     delay: int,
+    if_match: str | None = None,
 ) -> None:
     """Hand the pending dataset to the router, recording it as propagating.
 
@@ -267,7 +270,7 @@ async def _write_pending_dataset(
         until=dt_util.utcnow().timestamp() + delay + _WRITE_WINDOW_S,
     )
     try:
-        await data.set_pending_dataset_tlvs(dataset)
+        await data.set_pending_dataset_tlvs(dataset, if_match=if_match)
     except HomeAssistantError as err:
         # A definitive answer from the router, or the library's own refusal,
         # means nothing was written. A dropped connection leaves that open,
@@ -355,18 +358,44 @@ async def _async_migrate_network(call: ServiceCall) -> dict[str, Any]:
         # holding that dataset is counting down towards it. Superseding it
         # would race those timers -- a late replacement splits the mesh --
         # and would silently undo the change the user may not even know is
-        # queued. Refuse and say so; the library's own guard on the write
-        # backstops the race where one appears after this read.
-        if await data.get_pending_dataset_tlvs() is not None:
-            raise HomeAssistantError(
-                translation_domain=DOMAIN, translation_key="pending_dataset_in_place"
-            )
+        # queued. Refuse and say so, unless the user explicitly asked to
+        # replace it; the library's own guard on the write backstops the
+        # race where one appears after this read.
+        in_flight = None
+        pending_etag = None
+        if pending_read := await data.get_pending_dataset_tlvs_with_etag():
+            if not call.data[ATTR_REPLACE_PENDING]:
+                raise HomeAssistantError(
+                    translation_domain=DOMAIN,
+                    translation_key="pending_dataset_in_place",
+                )
+            pending_tlvs, pending_etag = pending_read
+            # Without an entity tag the router cannot check that what gets
+            # replaced is still what the user saw, so the replace would be
+            # unconditional -- the very thing replace_pending exists to
+            # avoid being. Only border routers that hand out tags offer it.
+            if pending_etag is None:
+                raise HomeAssistantError(
+                    translation_domain=DOMAIN,
+                    translation_key="replace_pending_unsupported",
+                )
+            try:
+                in_flight = tlv_parser.parse_tlv(pending_tlvs.hex())
+            except tlv_parser.TLVError as err:
+                raise HomeAssistantError(
+                    translation_domain=DOMAIN,
+                    translation_key="router_dataset_invalid",
+                ) from err
 
         # Only an identical dataset is a no-op. Comparing the extended PAN
         # ID alone would silently ignore a dataset that keeps the network
         # but replaces its credentials, which is how a network key is
-        # rotated.
-        if _same_network_settings(active, target):
+        # rotated. And it is only a no-op while nothing is queued: with a
+        # pending dataset being replaced, the mesh is about to leave this
+        # network, so re-targeting it is the point.
+        if _same_network_settings(active, target) and (
+            in_flight is None or _same_network_settings(in_flight, target)
+        ):
             return {"status": "already_on_network"}
 
         # A different radio (like Zigbee in multiprotocol setups) may pin
@@ -396,12 +425,19 @@ async def _async_migrate_network(call: ServiceCall) -> dict[str, Any]:
             )
 
         # The pending dataset must carry timestamps newer than the network
-        # being left: a not-newer pending dataset is silently ignored by
-        # the mesh while this action would still report success.
+        # being left, and, when replacing, newer than the dataset being
+        # replaced: a not-newer pending dataset is silently ignored by the
+        # mesh while this action would still report success.
         newest = max(
             _timestamp_parts(active, MeshcopTLVType.ACTIVETIMESTAMP),
             _timestamp_parts(target, MeshcopTLVType.ACTIVETIMESTAMP),
         )
+        if in_flight is not None:
+            newest = max(
+                newest,
+                _timestamp_parts(in_flight, MeshcopTLVType.ACTIVETIMESTAMP),
+                _timestamp_parts(in_flight, MeshcopTLVType.PENDINGTIMESTAMP),
+            )
         # The dataset store silently keeps an existing entry for the same
         # extended PAN ID unless the update is newer, so stamp above the
         # stored dataset too - or the mesh would migrate while the store
@@ -425,7 +461,9 @@ async def _async_migrate_network(call: ServiceCall) -> dict[str, Any]:
         # one in its place, and devices that only got the earlier dataset
         # end up on a different network than the rest. Refuse until the
         # earlier migration's delay has expired.
-        if remaining := issued.seconds_in_flight(source_xpan):
+        if not call.data[ATTR_REPLACE_PENDING] and (
+            remaining := issued.seconds_in_flight(source_xpan)
+        ):
             raise HomeAssistantError(
                 translation_domain=DOMAIN,
                 translation_key="migration_in_flight",
@@ -473,6 +511,9 @@ async def _async_migrate_network(call: ServiceCall) -> dict[str, Any]:
                     translation_key="preferred_dataset_changed",
                 )
 
+        # When replacing, the write is conditional on the router still
+        # holding exactly the dataset the user saw and this action stamped
+        # above; the router checks the tag atomically with the write.
         await _write_pending_dataset(
             data,
             bytes.fromhex(tlv_parser.encode_tlv(pending)),
@@ -480,6 +521,7 @@ async def _async_migrate_network(call: ServiceCall) -> dict[str, Any]:
             source_xpan,
             (seconds, 0),
             delay,
+            if_match=pending_etag,
         )
 
         # What the network will run after the delay is the re-stamped
