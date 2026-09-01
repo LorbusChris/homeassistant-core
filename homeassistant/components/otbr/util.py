@@ -269,6 +269,13 @@ class OTBRData:
         return await self.api.get_pending_dataset_tlvs()
 
     @_handle_otbr_error
+    async def get_pending_dataset_tlvs_with_etag(
+        self,
+    ) -> tuple[bytes, str | None] | None:
+        """Get the pending dataset TLVs with its entity tag, or None."""
+        return await self.api.get_pending_dataset_tlvs_with_etag()
+
+    @_handle_otbr_error
     async def create_active_dataset(
         self, dataset: python_otbr_api.ActiveDataSet
     ) -> None:
@@ -286,21 +293,27 @@ class OTBRData:
         await self.api.set_active_dataset_tlvs(dataset)
 
     @_handle_otbr_error
-    async def set_pending_dataset_tlvs(self, dataset: bytes) -> None:
+    async def set_pending_dataset_tlvs(
+        self, dataset: bytes, *, if_match: str | None = None
+    ) -> None:
         """Set the pending operational dataset in TLVS format.
 
-        Refused while a pending dataset is in place; the wrapper turns that
-        refusal into the error that says so. A border router that registers
-        the dataset with the Thread leader (ot-br-posix#3582) reports two
-        more verdicts: a rejection -- it is not attached, the leader refused
-        the dataset, or an earlier registration is still being answered --
-        in the router's own words, and no verdict at all, when the leader
-        did not answer in time. Each gets its own error, since the caller
-        has to treat them differently: nothing happened, versus something
-        may have.
+        Refused while a pending dataset is in place, unless if_match names
+        the entity tag of exactly the dataset being replaced. The wrapper
+        turns the plain refusal into the error that says so; a conditional
+        replace that lost its race needs the other message, since what the
+        caller asked to replace is gone rather than still propagating.
+
+        A border router that registers the dataset with the Thread leader
+        (ot-br-posix#3582) reports two more verdicts: a rejection -- it is
+        not attached, the leader refused the dataset, or an earlier
+        registration is still being answered -- in the router's own words,
+        and no verdict at all, when the leader did not answer in time. Each
+        gets its own error, since the caller has to treat them differently:
+        nothing happened, versus something may have.
         """
         try:
-            await self.api.set_pending_dataset_tlvs(dataset)
+            await self.api.set_pending_dataset_tlvs(dataset, if_match=if_match)
         except python_otbr_api.PendingDatasetRejectedError as exc:
             if exc.reason:
                 raise HomeAssistantError(
@@ -314,6 +327,13 @@ class OTBRData:
         except python_otbr_api.PendingDatasetOutcomeUnknownError as exc:
             raise HomeAssistantError(
                 translation_domain=DOMAIN, translation_key="pending_dataset_unanswered"
+            ) from exc
+        except python_otbr_api.PendingDatasetConflictError as exc:
+            if if_match is None:
+                raise
+            raise HomeAssistantError(
+                translation_domain=DOMAIN,
+                translation_key="pending_dataset_changed",
             ) from exc
 
     @_handle_otbr_error

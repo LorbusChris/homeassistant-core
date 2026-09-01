@@ -19,3 +19,8 @@ migrate_network:
           max: 3600
           unit_of_measurement: seconds
           mode: box
+    replace_pending:
+      required: false
+      default: false
+      selector:
+        boolean:
