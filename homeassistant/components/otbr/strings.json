@@ -45,6 +45,9 @@
     "pending_dataset_refused": {
       "message": "The border router refused the pending dataset: it is not attached to a Thread network, or the network's leader rejected the dataset as not newer than the one in place."
     },
+    "pending_dataset_unanswered": {
+      "message": "The border router registered the dataset with the network's leader but got no answer, so the migration may be under way. Wait for the delay to pass before trying again."
+    },
     "pinned_router_unreachable": {
       "message": "The border router {router} pins the Thread channel for another radio, but could not be read to check whether it is on this network. Try again once it is reachable."
     },

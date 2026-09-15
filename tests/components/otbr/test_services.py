@@ -81,6 +81,11 @@ def mock_pending_endpoint(
     """Mock the router's pending-dataset endpoint."""
     aioclient_mock.clear_requests()
     aioclient_mock.get(re.compile(r".*/api/actions$"), status=HTTPStatus.OK)
+    # A router that writes the pending dataset locally; the tests of one that
+    # registers it with the leader announce that with a version.
+    aioclient_mock.get(
+        f"{BASE_URL}/.well-known/thread/br-rest", status=HTTPStatus.NOT_FOUND
+    )
     if in_flight is None:
         aioclient_mock.get(
             f"{BASE_URL}/node/dataset/pending", status=HTTPStatus.NO_CONTENT
@@ -376,6 +381,9 @@ async def test_a_write_that_never_arrived_frees_the_migration_window(
     mock_pending_endpoint(aioclient_mock)
     aioclient_mock.clear_requests()
     aioclient_mock.get(re.compile(r".*/api/actions$"), status=HTTPStatus.OK)
+    aioclient_mock.get(
+        f"{BASE_URL}/.well-known/thread/br-rest", status=HTTPStatus.NOT_FOUND
+    )
     aioclient_mock.get(f"{BASE_URL}/node/dataset/pending", status=HTTPStatus.NO_CONTENT)
     aioclient_mock.put(f"{BASE_URL}/node/dataset/pending", exc=aiohttp.ClientError)
 
@@ -438,6 +446,9 @@ async def test_a_lost_connection_keeps_the_migration_window(
     mock_pending_endpoint(aioclient_mock)
     aioclient_mock.clear_requests()
     aioclient_mock.get(re.compile(r".*/api/actions$"), status=HTTPStatus.OK)
+    aioclient_mock.get(
+        f"{BASE_URL}/.well-known/thread/br-rest", status=HTTPStatus.NOT_FOUND
+    )
 
     # Nothing before the write (this action checks, then the library checks
     # again), the written dataset after it: the connection died reporting a
@@ -501,6 +512,66 @@ async def test_already_on_network(
 
     assert response == {"status": "already_on_network"}
     assert not pending_calls(aioclient_mock)
+
+
+async def test_an_unanswered_registration_keeps_the_migration_window(
+    hass: HomeAssistant,
+    otbr_config_entry_multipan: str,
+    aioclient_mock: AiohttpClientMocker,
+    freezer: FrozenDateTimeFactory,
+) -> None:
+    """A router that got no answer from the leader may have migrated the mesh.
+
+    A border router that registers the dataset with the Thread leader
+    reports no verdict in time as its own status, and the dataset may well
+    have been accepted. That is the dropped-connection case with a name on
+    it: the window is kept, measured from now, and the user is told why.
+    """
+    mock_pending_endpoint(aioclient_mock, put_status=HTTPStatus.GATEWAY_TIMEOUT)
+
+    with pytest.raises(HomeAssistantError) as exc_info:
+        await call_migrate(hass, dataset=TARGET, delay=600)
+    assert exc_info.value.translation_key == "pending_dataset_unanswered"
+
+    mock_pending_endpoint(aioclient_mock)
+    freezer.tick(595)
+    with pytest.raises(HomeAssistantError) as exc_info:
+        await call_migrate(hass, dataset=TARGET)
+    assert exc_info.value.translation_key == "migration_in_flight"
+    assert exc_info.value.translation_placeholders == {"remaining": "5"}
+
+
+async def test_a_lost_connection_to_a_leader_registering_router_keeps_the_window(
+    hass: HomeAssistant,
+    otbr_config_entry_multipan: str,
+    aioclient_mock: AiohttpClientMocker,
+    freezer: FrozenDateTimeFactory,
+) -> None:
+    """A router that registers with the leader is not asked what it holds.
+
+    Its own copy of the pending dataset only arrives once the leader hands
+    it back to the mesh, so right after a dropped connection "none" is not
+    an answer. The window is kept on the strength of the API version alone,
+    even though the router reports no pending dataset.
+    """
+    mock_pending_endpoint(aioclient_mock)
+    aioclient_mock.clear_requests()
+    aioclient_mock.get(re.compile(r".*/api/actions$"), status=HTTPStatus.OK)
+    aioclient_mock.get(
+        f"{BASE_URL}/.well-known/thread/br-rest", json={"api": {"version": "0.6.0"}}
+    )
+    aioclient_mock.get(f"{BASE_URL}/node/dataset/pending", status=HTTPStatus.NO_CONTENT)
+    aioclient_mock.put(f"{BASE_URL}/node/dataset/pending", exc=aiohttp.ClientError)
+
+    with pytest.raises(HomeAssistantError):
+        await call_migrate(hass, dataset=TARGET, delay=600)
+
+    mock_pending_endpoint(aioclient_mock)
+    freezer.tick(595)
+    with pytest.raises(HomeAssistantError) as exc_info:
+        await call_migrate(hass, dataset=TARGET)
+    assert exc_info.value.translation_key == "migration_in_flight"
+    assert exc_info.value.translation_placeholders == {"remaining": "5"}
 
 
 async def test_a_router_that_refuses_the_pending_dataset_says_so(
