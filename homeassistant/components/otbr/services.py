@@ -415,19 +415,21 @@ async def _async_next_seconds(
     """Return the seconds to stamp the pending dataset with.
 
     Above the network being left and the target, or the mesh silently
-    ignores the dataset; above the store's entry for the target, or the
-    store keeps the old credentials while the mesh migrates; and above what
-    this integration already handed out for the mesh, since a second router
-    on it can still read the old active dataset and no pending one.
+    ignores the dataset; above the store's entries for both, since the store
+    can know the network being left newer than this router does, and stamped
+    below the target's entry the store keeps the old credentials while the
+    mesh migrates; and above what this integration already handed out for the
+    mesh, since a second router on it can still read the old active dataset
+    and no pending one.
     """
     newest = max(
         _timestamp_parts(active, MeshcopTLVType.ACTIVETIMESTAMP),
         _timestamp_parts(target, MeshcopTLVType.ACTIVETIMESTAMP),
     )
     store = await async_get_store(hass)
-    target_xpan = str(target[MeshcopTLVType.EXTPANID]).lower()
+    xpans = {source_xpan, str(target[MeshcopTLVType.EXTPANID]).lower()}
     for entry in store.datasets.values():
-        if entry.extended_pan_id.lower() == target_xpan:
+        if entry.extended_pan_id.lower() in xpans:
             newest = max(
                 newest, _timestamp_parts(entry.dataset, MeshcopTLVType.ACTIVETIMESTAMP)
             )

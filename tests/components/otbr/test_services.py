@@ -1022,6 +1022,32 @@ async def test_the_stored_dataset_raises_the_stamp(
     assert _timestamp_parts_seconds(stored_entry.tlv) == 1501
 
 
+async def test_the_stored_source_dataset_raises_the_stamp(
+    hass: HomeAssistant,
+    otbr_config_entry_multipan: str,
+    aioclient_mock: AiohttpClientMocker,
+) -> None:
+    """A stored copy of the network being left out-stamps a stale router.
+
+    The store can know the network newer than the router the action was
+    handed to. Stamped below that, the rest of the mesh discards the dataset
+    when the delay expires, and this router moves alone.
+    """
+    mock_pending_endpoint(aioclient_mock)
+    stored = dict(tlv_parser.parse_tlv(DATASET_CH16.hex()))
+    stored[MeshcopTLVType.ACTIVETIMESTAMP] = Timestamp.from_values(
+        MeshcopTLVType.ACTIVETIMESTAMP, seconds=1500
+    )
+    await async_add_dataset(hass, "test", tlv_parser.encode_tlv(stored))
+
+    await call_migrate(hass, dataset=TARGET)
+
+    stamp = tlv_parser.parse_tlv(pending_calls(aioclient_mock)[0][2])[
+        MeshcopTLVType.ACTIVETIMESTAMP
+    ]
+    assert (stamp.seconds, stamp.ticks) == (1501, 0)
+
+
 async def test_migration_is_persisted_before_success_is_reported(
     hass: HomeAssistant,
     otbr_config_entry_multipan: str,
