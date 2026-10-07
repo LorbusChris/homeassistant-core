@@ -586,6 +586,257 @@ async def test_an_unanswered_registration_keeps_the_migration_window(
     assert exc_info.value.translation_placeholders == {"remaining": "5"}
 
 
+async def test_an_unanswered_migration_is_finished_once_the_router_is_on_its_target(
+    hass: HomeAssistant,
+    otbr_config_entry_multipan: str,
+    aioclient_mock: AiohttpClientMocker,
+    get_active_dataset_tlvs: AsyncMock,
+    freezer: FrozenDateTimeFactory,
+) -> None:
+    """A router found on the network it was sent to settles an unanswered write.
+
+    No answer from the leader records nothing but the window, since nothing
+    may have been written. Once the router reports the target, the migrated
+    dataset is stored and the preferred pointer moved, before a call without
+    a dataset reads that pointer: it would otherwise migrate the mesh straight
+    back onto the network left behind.
+    """
+    store = await async_get_store(hass)
+    store.preferred_dataset = next(iter(store.datasets.values())).id
+    mock_pending_endpoint(aioclient_mock, put_status=HTTPStatus.GATEWAY_TIMEOUT)
+    with pytest.raises(HomeAssistantError) as exc_info:
+        await call_migrate(hass, dataset=TARGET)
+    assert exc_info.value.translation_key == "pending_dataset_unanswered"
+
+    # The mesh switched after all: the router runs the re-stamped target.
+    migrated = dict(tlv_parser.parse_tlv(TARGET))
+    migrated[MeshcopTLVType.ACTIVETIMESTAMP] = Timestamp.from_values(
+        MeshcopTLVType.ACTIVETIMESTAMP, seconds=1004
+    )
+    get_active_dataset_tlvs.return_value = bytes.fromhex(
+        tlv_parser.encode_tlv(migrated)
+    )
+    freezer.tick(301)
+    mock_pending_endpoint(aioclient_mock)
+
+    assert (await call_migrate(hass, dataset=TARGET))["status"] == (
+        "already_on_network"
+    )
+    preferred = store.datasets[store.preferred_dataset]
+    assert preferred.extended_pan_id.lower() == "1111111122222222"
+    # The default target is the migrated network now, not the one left.
+    assert (await call_migrate(hass))["status"] == "already_on_network"
+    assert not pending_calls(aioclient_mock)
+
+
+async def test_a_router_on_the_target_all_along_settles_nothing(
+    hass: HomeAssistant,
+    otbr_config_entry_thread: None,
+    otbr_config_entry_multipan: str,
+    aioclient_mock: AiohttpClientMocker,
+    freezer: FrozenDateTimeFactory,
+) -> None:
+    """Only the router the dataset was handed to can show that it landed.
+
+    Another router on the target may have been there all along, and its stamp
+    can reach the issued one on its own, through a channel change. Found
+    there, it must not move the preferred pointer off the network the
+    migration was to leave, nor forget that migration.
+    """
+    store = await async_get_store(hass)
+    store.preferred_dataset = next(iter(store.datasets.values())).id
+    mock_pending_endpoint(aioclient_mock, put_status=HTTPStatus.GATEWAY_TIMEOUT)
+    with pytest.raises(HomeAssistantError):
+        await call_migrate(
+            hass, dataset=TARGET, config_entry=otbr_config_entry_multipan
+        )
+    freezer.tick(301)
+
+    thread_entry = next(
+        entry
+        for entry in hass.config_entries.async_loaded_entries("otbr")
+        if entry.entry_id != otbr_config_entry_multipan
+    )
+    on_target = dict(tlv_parser.parse_tlv(TARGET))
+    on_target[MeshcopTLVType.ACTIVETIMESTAMP] = Timestamp.from_values(
+        MeshcopTLVType.ACTIVETIMESTAMP, seconds=1004
+    )
+    with (
+        patch.object(
+            thread_entry.runtime_data,
+            "get_active_dataset_tlvs",
+            return_value=bytes.fromhex(tlv_parser.encode_tlv(on_target)),
+        ),
+        patch.object(
+            thread_entry.runtime_data, "get_pending_dataset_tlvs", return_value=None
+        ),
+    ):
+        response = await call_migrate(
+            hass, dataset=TARGET, config_entry=thread_entry.entry_id
+        )
+
+    assert response["status"] == "already_on_network"
+    assert store.datasets[store.preferred_dataset].extended_pan_id.lower() == (
+        "f642646da209b1c0"
+    )
+    issued = await async_get_issued_timestamps(hass)
+    assert issued.migration_source("1111111122222222", otbr_config_entry_multipan) == (
+        "f642646da209b1c0"
+    )
+
+
+async def test_a_finished_migration_refreshes_the_repair_issues(
+    hass: HomeAssistant,
+    otbr_config_entry_thread: None,
+    otbr_config_entry_multipan: str,
+    aioclient_mock: AiohttpClientMocker,
+    freezer: FrozenDateTimeFactory,
+    issue_registry: ir.IssueRegistry,
+) -> None:
+    """A migration settled late refreshes the repair issues like one that answered.
+
+    Both the router found on the new network and the others the dataset
+    reached still carry the issues of the network left behind.
+    """
+    insecure = dict(tlv_parser.parse_tlv(TARGET))
+    insecure[MeshcopTLVType.NETWORKKEY] = tlv_parser.MeshcopTLVItem(
+        MeshcopTLVType.NETWORKKEY, INSECURE_NETWORK_KEYS[0]
+    )
+    mock_pending_endpoint(aioclient_mock, put_status=HTTPStatus.GATEWAY_TIMEOUT)
+    with pytest.raises(HomeAssistantError):
+        await call_migrate(
+            hass,
+            dataset=tlv_parser.encode_tlv(insecure),
+            config_entry=otbr_config_entry_multipan,
+        )
+    thread_entry = next(
+        entry
+        for entry in hass.config_entries.async_loaded_entries("otbr")
+        if entry.entry_id != otbr_config_entry_multipan
+    )
+    for entry_id in (otbr_config_entry_multipan, thread_entry.entry_id):
+        assert not issue_registry.async_get_issue(
+            domain="otbr", issue_id=f"insecure_thread_network_{entry_id}"
+        )
+
+    migrated = dict(insecure)
+    migrated[MeshcopTLVType.ACTIVETIMESTAMP] = Timestamp.from_values(
+        MeshcopTLVType.ACTIVETIMESTAMP, seconds=1004
+    )
+    multipan_entry = hass.config_entries.async_get_entry(otbr_config_entry_multipan)
+    assert multipan_entry is not None
+    freezer.tick(301)
+    mock_pending_endpoint(aioclient_mock)
+    with patch.object(
+        multipan_entry.runtime_data,
+        "get_active_dataset_tlvs",
+        return_value=bytes.fromhex(tlv_parser.encode_tlv(migrated)),
+    ):
+        response = await call_migrate(
+            hass,
+            dataset=tlv_parser.encode_tlv(insecure),
+            config_entry=otbr_config_entry_multipan,
+        )
+
+    assert response["status"] == "already_on_network"
+    for entry_id in (otbr_config_entry_multipan, thread_entry.entry_id):
+        assert issue_registry.async_get_issue(
+            domain="otbr", issue_id=f"insecure_thread_network_{entry_id}"
+        )
+
+
+async def test_a_finished_migration_reports_a_discarded_store_write(
+    hass: HomeAssistant,
+    otbr_config_entry_multipan: str,
+    aioclient_mock: AiohttpClientMocker,
+    get_active_dataset_tlvs: AsyncMock,
+    freezer: FrozenDateTimeFactory,
+) -> None:
+    """Newer stored credentials for the network found are reported, as after a write.
+
+    The migration is settled first, pointer included, and nothing more is
+    written in that call.
+    """
+    store = await async_get_store(hass)
+    store.preferred_dataset = next(iter(store.datasets.values())).id
+    mock_pending_endpoint(aioclient_mock, put_status=HTTPStatus.GATEWAY_TIMEOUT)
+    with pytest.raises(HomeAssistantError):
+        await call_migrate(hass, dataset=TARGET)
+    # Newer credentials for the target were stored in the meantime.
+    newer = dict(tlv_parser.parse_tlv(TARGET))
+    newer[MeshcopTLVType.ACTIVETIMESTAMP] = Timestamp.from_values(
+        MeshcopTLVType.ACTIVETIMESTAMP, seconds=2000
+    )
+    await async_add_dataset(hass, "other", tlv_parser.encode_tlv(newer))
+
+    migrated = dict(tlv_parser.parse_tlv(TARGET))
+    migrated[MeshcopTLVType.ACTIVETIMESTAMP] = Timestamp.from_values(
+        MeshcopTLVType.ACTIVETIMESTAMP, seconds=1004
+    )
+    get_active_dataset_tlvs.return_value = bytes.fromhex(
+        tlv_parser.encode_tlv(migrated)
+    )
+    freezer.tick(301)
+    mock_pending_endpoint(aioclient_mock)
+    with pytest.raises(HomeAssistantError) as exc_info:
+        await call_migrate(hass, dataset=TARGET)
+
+    assert exc_info.value.translation_key == "dataset_discarded"
+    assert not pending_calls(aioclient_mock)
+    assert store.datasets[store.preferred_dataset].extended_pan_id.lower() == (
+        "1111111122222222"
+    )
+    # Settled: the next call is a plain no-op.
+    assert (await call_migrate(hass, dataset=TARGET))["status"] == (
+        "already_on_network"
+    )
+
+
+async def test_a_refused_retry_keeps_the_unanswered_migration(
+    hass: HomeAssistant,
+    otbr_config_entry_multipan: str,
+    aioclient_mock: AiohttpClientMocker,
+    get_active_dataset_tlvs: AsyncMock,
+    freezer: FrozenDateTimeFactory,
+) -> None:
+    """A later write the router refuses puts back the migration still to settle.
+
+    The retry may target another network through a router that never
+    switched. Refused, it must not take the earlier migration's record with
+    it: the router found on that network later would settle nothing, and a
+    call without a dataset could migrate the mesh back.
+    """
+    store = await async_get_store(hass)
+    store.preferred_dataset = next(iter(store.datasets.values())).id
+    mock_pending_endpoint(aioclient_mock, put_status=HTTPStatus.GATEWAY_TIMEOUT)
+    with pytest.raises(HomeAssistantError):
+        await call_migrate(hass, dataset=TARGET)
+    freezer.tick(301)
+
+    other_target = dict(tlv_parser.parse_tlv(TARGET))
+    other_target[MeshcopTLVType.EXTPANID] = tlv_parser.MeshcopTLVItem(
+        MeshcopTLVType.EXTPANID, bytes.fromhex("3333333344444444")
+    )
+    mock_pending_endpoint(aioclient_mock, put_status=HTTPStatus.PRECONDITION_FAILED)
+    with pytest.raises(HomeAssistantError):
+        await call_migrate(hass, dataset=tlv_parser.encode_tlv(other_target))
+
+    migrated = dict(tlv_parser.parse_tlv(TARGET))
+    migrated[MeshcopTLVType.ACTIVETIMESTAMP] = Timestamp.from_values(
+        MeshcopTLVType.ACTIVETIMESTAMP, seconds=1004
+    )
+    get_active_dataset_tlvs.return_value = bytes.fromhex(
+        tlv_parser.encode_tlv(migrated)
+    )
+    mock_pending_endpoint(aioclient_mock)
+    assert (await call_migrate(hass, dataset=TARGET))["status"] == (
+        "already_on_network"
+    )
+    assert store.datasets[store.preferred_dataset].extended_pan_id.lower() == (
+        "1111111122222222"
+    )
+
+
 async def test_a_lost_connection_to_a_leader_registering_router_keeps_the_window(
     hass: HomeAssistant,
     otbr_config_entry_multipan: str,
@@ -1518,7 +1769,7 @@ async def test_preferred_dataset_replaced_while_reading_the_router(
     hass: HomeAssistant,
     otbr_config_entry_multipan: str,
     aioclient_mock: AiohttpClientMocker,
-    get_active_dataset_tlvs: AsyncMock,
+    get_border_agent_id: AsyncMock,
 ) -> None:
     """Test a superseded preferred dataset is refused before anything is sent.
 
@@ -1537,6 +1788,8 @@ async def test_preferred_dataset_replaced_while_reading_the_router(
         if entry.extended_pan_id.lower() == "1111111122222222"
     )
 
+    border_agent_id = get_border_agent_id.return_value
+
     async def replace_preferred_dataset() -> bytes:
         """Rotate the preferred network's key while the router is read."""
         rotated = dict(tlv_parser.parse_tlv(TARGET))
@@ -1547,9 +1800,9 @@ async def test_preferred_dataset_replaced_while_reading_the_router(
             MeshcopTLVType.ACTIVETIMESTAMP, seconds=1010
         )
         await async_add_dataset(hass, "panel", tlv_parser.encode_tlv(rotated))
-        return DATASET_CH16
+        return border_agent_id
 
-    get_active_dataset_tlvs.side_effect = replace_preferred_dataset
+    get_border_agent_id.side_effect = replace_preferred_dataset
 
     with pytest.raises(HomeAssistantError) as exc_info:
         await call_migrate(hass)

@@ -57,6 +57,10 @@ _LEADER_REGISTERING_API = AwesomeVersion("0.6.0")
 # as the library allows.
 _WRITE_WINDOW_S = 2 * API_TIMEOUT + PENDING_DATASET_TIMEOUT
 
+# What IssuedTimestamps holds for one network: the newest stamp issued, until
+# when it propagates, and the migration under way (target, router) if any.
+type _Record = tuple[tuple[int, int], float, tuple[str, str] | None]
+
 
 class IssuedTimestamps:
     """The newest timestamp this integration has issued, per source network.
@@ -73,6 +77,10 @@ class IssuedTimestamps:
     migration handed to a router that has not learned the first dataset yet
     supersedes it, and devices that only ever received the first one switch
     to a different network than the rest.
+
+    It also remembers which network a migration moves to, and through which
+    router, until the migration is recorded: a write the router never answered
+    may have landed, and that router later found on that network settles it.
     """
 
     def __init__(self, hass: HomeAssistant) -> None:
@@ -87,6 +95,7 @@ class IssuedTimestamps:
         )
         self._issued: dict[str, tuple[int, int]] = {}
         self._until: dict[str, float] = {}
+        self._migration: dict[str, tuple[str, str]] = {}
 
     async def async_load(self) -> None:
         """Load what was issued before the last restart."""
@@ -95,6 +104,10 @@ class IssuedTimestamps:
                 seconds, ticks = record["timestamp"]
                 self._issued[xpan] = (seconds, ticks)
                 self._until[xpan] = record["until"]
+                if (target := record.get("target")) and (
+                    router := record.get("router")
+                ):
+                    self._migration[xpan] = (target, router)
 
     def get(self, extended_pan_id: str) -> tuple[int, int]:
         """Return the newest timestamp issued for a network."""
@@ -108,11 +121,39 @@ class IssuedTimestamps:
         remaining = self._until.get(extended_pan_id, 0) - dt_util.utcnow().timestamp()
         return max(0, math.ceil(remaining))
 
-    def record(self, extended_pan_id: str) -> tuple[tuple[int, int], float] | None:
+    def record(self, extended_pan_id: str) -> _Record | None:
         """Return what is recorded for a network, to hand to async_restore."""
         if extended_pan_id not in self._issued:
             return None
-        return (self._issued[extended_pan_id], self._until[extended_pan_id])
+        return (
+            self._issued[extended_pan_id],
+            self._until[extended_pan_id],
+            self._migration.get(extended_pan_id),
+        )
+
+    def migration_source(
+        self, target_extended_pan_id: str, router_entry_id: str
+    ) -> str | None:
+        """Return the network an unrecorded migration left for this one.
+
+        Known from the moment a migration's dataset is handed to a router
+        until the migration is recorded; in between, that router found on the
+        target says the write landed although its answer was lost. Another
+        router on the target says nothing: it may have been there all along.
+        """
+        return next(
+            (
+                source
+                for source, migration in self._migration.items()
+                if migration == (target_extended_pan_id, router_entry_id)
+            ),
+            None,
+        )
+
+    async def async_confirm(self, extended_pan_id: str) -> None:
+        """Forget the target of a migration now recorded."""
+        if self._migration.pop(extended_pan_id, None) is not None:
+            await self._async_save()
 
     async def async_set(
         self, extended_pan_id: str, timestamp: tuple[int, int], *, until: float
@@ -131,19 +172,26 @@ class IssuedTimestamps:
         self._until[extended_pan_id] = until
         await self._async_save()
 
-    async def async_restore(
-        self, extended_pan_id: str, record: tuple[tuple[int, int], float] | None
-    ) -> None:
+    async def async_restore(self, extended_pan_id: str, record: _Record | None) -> None:
         """Put back what record() returned, when the issued dataset never left.
 
         A router that refused the write leaves no migration under way; the
         window recorded for it would only refuse every retry until it expired.
+        An earlier migration still to be settled is put back with the rest,
+        since the refused write may have been a retry over it.
         """
         if record is None:
             self._issued.pop(extended_pan_id, None)
             self._until.pop(extended_pan_id, None)
+            self._migration.pop(extended_pan_id, None)
         else:
-            self._issued[extended_pan_id], self._until[extended_pan_id] = record
+            stamp, until, migration = record
+            self._issued[extended_pan_id] = stamp
+            self._until[extended_pan_id] = until
+            if migration is None:
+                self._migration.pop(extended_pan_id, None)
+            else:
+                self._migration[extended_pan_id] = migration
         await self._async_save()
 
     async def async_write(
@@ -153,8 +201,13 @@ class IssuedTimestamps:
         timestamp: tuple[int, int],
         delay: float,
         write: Callable[[], Coroutine[Any, Any, None]],
+        migration: tuple[str, str] | None = None,
     ) -> None:
         """Run a pending dataset write inside the window it opens on the mesh.
+
+        `migration` names the network a migration moves to and the router it
+        is handed to. It is kept until the migration is recorded, so one
+        whose answer was lost can be finished once that router is found there.
 
         The record is written before the write and deliberately outlasts the
         delay: the router starts its own timer only once it accepts the
@@ -165,6 +218,8 @@ class IssuedTimestamps:
         once the write completes.
         """
         previous = self.record(extended_pan_id)
+        if migration is not None:
+            self._migration[extended_pan_id] = migration
         await self.async_set(
             extended_pan_id,
             timestamp,
@@ -213,12 +268,16 @@ class IssuedTimestamps:
         )
 
     async def _async_save(self) -> None:
-        await self._store.async_save(
-            {
-                xpan: {"timestamp": list(stamp), "until": self._until[xpan]}
-                for xpan, stamp in self._issued.items()
+        data: dict[str, dict[str, Any]] = {}
+        for xpan, stamp in self._issued.items():
+            record: dict[str, Any] = {
+                "timestamp": list(stamp),
+                "until": self._until[xpan],
             }
-        )
+            if migration := self._migration.get(xpan):
+                record["target"], record["router"] = migration
+            data[xpan] = record
+        await self._store.async_save(data)
 
 
 @singleton(ISSUED_TIMESTAMPS_KEY, async_=True)

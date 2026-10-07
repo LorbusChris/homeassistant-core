@@ -1,5 +1,6 @@
 """Actions for the Open Thread Border Router integration."""
 
+from dataclasses import dataclass
 import logging
 from typing import TYPE_CHECKING, Any
 
@@ -464,6 +465,47 @@ def _pending_dataset(
     return pending
 
 
+@dataclass(frozen=True, slots=True)
+class _Migration:
+    """A migration recorded for a mesh, reported on once the lock is released."""
+
+    left: str
+    tlvs: bytes
+    result: DatasetAddResult
+
+
+async def _async_finish_unanswered_migration(
+    hass: HomeAssistant,
+    entry: OTBRConfigEntry,
+    data: OTBRData,
+    issued: IssuedTimestamps,
+    active: dict[MeshcopTLVType | int, tlv_parser.MeshcopTLVItem],
+    extended_pan_id: str,
+) -> _Migration | None:
+    """Record a migration whose answer was lost, now the router is on its target.
+
+    A write the router never answered keeps the window but records nothing
+    else, since nothing may have been written. The router it was handed to
+    reporting the network it moved to, stamped at or above what it was sent,
+    settles it: store what it runs and move the preferred pointer, before a
+    default target is read from a pointer still naming the network left.
+    """
+    left = issued.migration_source(extended_pan_id, entry.entry_id)
+    if left is None:
+        return None
+    if _timestamp_parts(active, MeshcopTLVType.ACTIVETIMESTAMP) < issued.get(left):
+        # A rotation keeps the network's name; this router has not switched.
+        return None
+    border_agent_id = (await data.get_border_agent_id()).hex()
+    extended_address = (await data.get_extended_address()).hex()
+    tlvs = bytes.fromhex(tlv_parser.encode_tlv(active))
+    result = await _async_record_migration(
+        hass, left, extended_pan_id, tlvs, border_agent_id, extended_address
+    )
+    await issued.async_confirm(left)
+    return _Migration(left, tlvs, result)
+
+
 async def _async_record_migration(
     hass: HomeAssistant,
     source_xpan: str,
@@ -492,14 +534,120 @@ async def _async_record_migration(
     return result
 
 
+async def _async_migrate_under_lock(
+    call: ServiceCall,
+    entry: OTBRConfigEntry,
+    data: OTBRData,
+    issued: IssuedTimestamps,
+    active: dict[MeshcopTLVType | int, tlv_parser.MeshcopTLVItem],
+    source_xpan: str,
+) -> tuple[dict[str, Any], _Migration | None]:
+    """Run the migration's checks and its write, in the order that protects the mesh.
+
+    Each check says why it comes where it does. Returns the action's response
+    and the migration recorded, if one was written.
+    """
+    # Resolved under the lock and after the step above: a queued
+    # no-dataset call must see the preferred dataset as repointed by the
+    # migration it waited for, or by one whose answer was lost, or it
+    # would migrate the router straight back.
+    dataset = await _target_dataset(call)
+    target = _parse_target(dataset)
+
+    # A pending dataset in flight means the mesh is mid-change, every
+    # device counting down towards it. Superseding it would race those
+    # timers and silently undo a change the user may not know is queued.
+    # The library's own guard on the write backstops the race where one
+    # appears after this read.
+    if await data.get_pending_dataset_tlvs() is not None:
+        raise HomeAssistantError(
+            translation_domain=DOMAIN, translation_key="pending_dataset_in_place"
+        )
+
+    delay = _effective_delay(active, target, call.data[ATTR_DELAY])
+
+    # A newer stamp is not enough while an earlier dataset issued for
+    # this mesh is still propagating: a router that has not learned it
+    # yet accepts this one in its place, and devices that only got the
+    # earlier dataset end up on a different network than the rest.
+    if remaining := issued.seconds_in_flight(source_xpan):
+        raise HomeAssistantError(
+            translation_domain=DOMAIN,
+            translation_key="migration_in_flight",
+            translation_placeholders={"remaining": str(remaining)},
+        )
+
+    # Only an identical dataset is a no-op: a dataset that keeps the
+    # network but replaces its credentials is how a key is rotated.
+    # Checked after the window above, since this router can still report
+    # an active dataset the mesh is already leaving.
+    if _same_network_settings(active, target):
+        return {"status": "already_on_network"}, None
+
+    await _async_check_channel(call.hass, entry, active, target)
+
+    seconds = await _async_next_seconds(call.hass, active, target, issued, source_xpan)
+    pending = _pending_dataset(target, seconds, delay)
+
+    # Fetched before the write: a failure here must abort the action
+    # before the mesh starts migrating, not after.
+    border_agent_id = (await data.get_border_agent_id()).hex()
+    extended_address = (await data.get_extended_address()).hex()
+
+    if call.data.get(ATTR_DATASET) is None:
+        # The target came from the preferred dataset, which another writer
+        # can replace while the router is being read. Sending the snapshot
+        # would put credentials on the mesh that Home Assistant has already
+        # superseded -- stamped newer, so the newer ones would be lost.
+        preferred = await async_get_preferred_dataset(call.hass)
+        if preferred is not None and bytes.fromhex(preferred) != dataset:
+            raise HomeAssistantError(
+                translation_domain=DOMAIN,
+                translation_key="preferred_dataset_changed",
+            )
+
+    pending_tlvs = bytes.fromhex(tlv_parser.encode_tlv(pending))
+    await issued.async_write(
+        data,
+        source_xpan,
+        (seconds, 0),
+        delay,
+        lambda: data.set_pending_dataset_tlvs(pending_tlvs),
+        migration=(str(target[MeshcopTLVType.EXTPANID]).lower(), entry.entry_id),
+    )
+
+    # What the network will run after the delay is the re-stamped
+    # dataset, bound to this router the same way setup binds datasets.
+    del pending[MeshcopTLVType.PENDINGTIMESTAMP]
+    del pending[MeshcopTLVType.DELAYTIMER]
+    migrated_tlvs = bytes.fromhex(tlv_parser.encode_tlv(pending))
+    result = await _async_record_migration(
+        call.hass,
+        source_xpan,
+        str(target[MeshcopTLVType.EXTPANID]),
+        migrated_tlvs,
+        border_agent_id,
+        extended_address,
+    )
+    await issued.async_confirm(source_xpan)
+
+    name_item = pending[MeshcopTLVType.NETWORKNAME]
+    if TYPE_CHECKING:
+        assert isinstance(name_item, tlv_parser.NetworkName)
+    return {
+        "status": "migrating",
+        "delay": delay,
+        "network_name": name_item.name,
+    }, _Migration(source_xpan, migrated_tlvs, result)
+
+
 async def _async_migrate_network(call: ServiceCall) -> dict[str, Any]:
     """Migrate a border router and every device on its network.
 
     The target dataset is re-stamped newer than the network being left, so
     it wins dataset propagation, and handed to the router as a pending
     dataset with a delay. The router spreads it; the network switches as
-    one when the delay expires. The checks run in an order that matters;
-    each says why.
+    one when the delay expires.
     """
     entry: OTBRConfigEntry = service.async_get_config_entry(
         call.hass, DOMAIN, call.data.get(ATTR_CONFIG_ENTRY)
@@ -507,99 +655,29 @@ async def _async_migrate_network(call: ServiceCall) -> dict[str, Any]:
     data = entry.runtime_data
 
     async with async_get_dataset_lock(call.hass):
-        # Resolved under the lock: a queued no-dataset call must see the
-        # preferred dataset as repointed by the migration it waited for,
-        # or it would migrate the router straight back.
-        dataset = await _target_dataset(call)
-        target = _parse_target(dataset)
         active, source_xpan = await _async_active_dataset(data)
-
-        # A pending dataset in flight means the mesh is mid-change, every
-        # device counting down towards it. Superseding it would race those
-        # timers and silently undo a change the user may not know is queued.
-        # The library's own guard on the write backstops the race where one
-        # appears after this read.
-        if await data.get_pending_dataset_tlvs() is not None:
-            raise HomeAssistantError(
-                translation_domain=DOMAIN, translation_key="pending_dataset_in_place"
-            )
-
-        delay = _effective_delay(active, target, call.data[ATTR_DELAY])
-
-        # A newer stamp is not enough while an earlier dataset issued for
-        # this mesh is still propagating: a router that has not learned it
-        # yet accepts this one in its place, and devices that only got the
-        # earlier dataset end up on a different network than the rest.
         issued = await async_get_issued_timestamps(call.hass)
-        if remaining := issued.seconds_in_flight(source_xpan):
-            raise HomeAssistantError(
-                translation_domain=DOMAIN,
-                translation_key="migration_in_flight",
-                translation_placeholders={"remaining": str(remaining)},
+        finished = await _async_finish_unanswered_migration(
+            call.hass, entry, data, issued, active, source_xpan
+        )
+        if finished is not None and finished.result is DatasetAddResult.DISCARDED:
+            # Reported below; nothing more is written to a mesh found running
+            # credentials the store has already superseded.
+            response: dict[str, Any] | None = None
+            migration = None
+        else:
+            response, migration = await _async_migrate_under_lock(
+                call, entry, data, issued, active, source_xpan
             )
-
-        # Only an identical dataset is a no-op: a dataset that keeps the
-        # network but replaces its credentials is how a key is rotated.
-        # Checked after the window above, since this router can still report
-        # an active dataset the mesh is already leaving.
-        if _same_network_settings(active, target):
-            return {"status": "already_on_network"}
-
-        await _async_check_channel(call.hass, entry, active, target)
-
-        seconds = await _async_next_seconds(
-            call.hass, active, target, issued, source_xpan
-        )
-        pending = _pending_dataset(target, seconds, delay)
-
-        # Fetched before the write: a failure here must abort the action
-        # before the mesh starts migrating, not after.
-        border_agent_id = (await data.get_border_agent_id()).hex()
-        extended_address = (await data.get_extended_address()).hex()
-
-        if call.data.get(ATTR_DATASET) is None:
-            # The target came from the preferred dataset, which another writer
-            # can replace while the router is being read. Sending the snapshot
-            # would put credentials on the mesh that Home Assistant has already
-            # superseded -- stamped newer, so the newer ones would be lost.
-            preferred = await async_get_preferred_dataset(call.hass)
-            if preferred is not None and bytes.fromhex(preferred) != dataset:
-                raise HomeAssistantError(
-                    translation_domain=DOMAIN,
-                    translation_key="preferred_dataset_changed",
-                )
-
-        pending_tlvs = bytes.fromhex(tlv_parser.encode_tlv(pending))
-        await issued.async_write(
-            data,
-            source_xpan,
-            (seconds, 0),
-            delay,
-            lambda: data.set_pending_dataset_tlvs(pending_tlvs),
-        )
-
-        # What the network will run after the delay is the re-stamped
-        # dataset, bound to this router the same way setup binds datasets.
-        del pending[MeshcopTLVType.PENDINGTIMESTAMP]
-        del pending[MeshcopTLVType.DELAYTIMER]
-        migrated_tlvs = bytes.fromhex(tlv_parser.encode_tlv(pending))
-        result = await _async_record_migration(
-            call.hass,
-            source_xpan,
-            str(target[MeshcopTLVType.EXTPANID]),
-            migrated_tlvs,
-            border_agent_id,
-            extended_address,
-        )
 
     # With the lock released: refreshing the other routers' repair issues
     # reads each of them, up to a timeout apiece, and no other dataset writer
     # should queue behind that.
-    await update_issues(call.hass, data, migrated_tlvs)
-    await _async_refresh_issues_on_the_mesh(
-        call.hass, entry, source_xpan, migrated_tlvs
-    )
-    if result is DatasetAddResult.DISCARDED:
+    recorded = [done for done in (finished, migration) if done is not None]
+    for done in recorded:
+        await update_issues(call.hass, data, done.tlvs)
+        await _async_refresh_issues_on_the_mesh(call.hass, entry, done.left, done.tlvs)
+    if any(done.result is DatasetAddResult.DISCARDED for done in recorded):
         # Newer credentials for this network were stored while the router
         # was being written to. The mesh is migrating to the dataset above
         # and cannot be called back, so say so rather than report a success
@@ -610,15 +688,9 @@ async def _async_migrate_network(call: ServiceCall) -> dict[str, Any]:
         raise HomeAssistantError(
             translation_domain=DOMAIN, translation_key="dataset_discarded"
         )
-
-    name_item = pending[MeshcopTLVType.NETWORKNAME]
     if TYPE_CHECKING:
-        assert isinstance(name_item, tlv_parser.NetworkName)
-    return {
-        "status": "migrating",
-        "delay": delay,
-        "network_name": name_item.name,
-    }
+        assert response is not None
+    return response
 
 
 @callback
