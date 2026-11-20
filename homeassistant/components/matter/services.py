@@ -1,14 +1,32 @@
 """Services for Matter devices."""
 
+from collections.abc import Callable
+from typing import Any, cast
+
+from chip.clusters.Types import NullValue
 from matter_server.client.exceptions import MatterClientException
+from matter_server.client.models.node import MatterEndpoint, MatterNode
 from matter_server.common.errors import MatterError
+from matter_server.common.models import ServerInfoMessage
 import probatio
 
 from homeassistant.components.lock import DOMAIN as LOCK_DOMAIN
+from homeassistant.components.thread import async_get_preferred_dataset
 from homeassistant.components.water_heater import DOMAIN as WATER_HEATER_DOMAIN
-from homeassistant.core import HomeAssistant, ServiceCall, SupportsResponse, callback
+from homeassistant.const import ATTR_DEVICE_ID
+from homeassistant.core import (
+    HomeAssistant,
+    ServiceCall,
+    ServiceResponse,
+    SupportsResponse,
+    callback,
+)
 from homeassistant.exceptions import HomeAssistantError, ServiceValidationError
-from homeassistant.helpers import config_validation as cv, service
+from homeassistant.helpers import (
+    config_validation as cv,
+    device_registry as dr,
+    service,
+)
 
 from .adapter import MatterAdapter
 from .const import (
@@ -16,12 +34,20 @@ from .const import (
     CREDENTIAL_RULE_REVERSE_MAP,
     CREDENTIAL_TYPE_REVERSE_MAP,
     DOMAIN,
+    ID_TYPE_DEVICE_ID,
     SERVICE_CREDENTIAL_TYPES,
     USER_TYPE_REVERSE_MAP,
     MatterService,
     MatterServiceArgument,
 )
-from .helpers import get_matter
+from .helpers import MissingNode, get_device_id, get_matter, node_from_ha_device_id
+from .thread_border_router import (
+    async_push_dataset,
+    async_read_dataset,
+    get_active_dataset_timestamp,
+    get_border_router_endpoints,
+    get_pending_dataset_timestamp,
+)
 
 
 def _get_matter(call: ServiceCall) -> MatterAdapter:
@@ -50,6 +76,115 @@ async def _async_set_wifi_credentials(call: ServiceCall) -> None:
         ) from err
 
 
+def _resolve_device(
+    call: ServiceCall, matter: MatterAdapter
+) -> tuple[MatterNode, Callable[[MatterEndpoint], bool]]:
+    """Return the node of the chosen device and a test for its own endpoints.
+
+    The test tells the endpoints the device stands for from those of bridged
+    devices on the same node.
+    """
+    device_id = call.data[ATTR_DEVICE_ID]
+    try:
+        node = node_from_ha_device_id(call.hass, device_id)
+    except MissingNode:
+        node = None
+    if node is None:
+        raise ServiceValidationError(
+            translation_domain=DOMAIN,
+            translation_key="invalid_device",
+            translation_placeholders={"device_id": device_id},
+        )
+    device = dr.async_get(call.hass).async_get(device_id, include_child_devices=False)
+    assert device is not None
+    identifiers = {value for domain, value in device.identifiers if domain == DOMAIN}
+    server_info = cast(ServerInfoMessage, matter.matter_client.server_info)
+
+    def is_own(endpoint: MatterEndpoint) -> bool:
+        identifier = f"{ID_TYPE_DEVICE_ID}_{get_device_id(server_info, endpoint)}"
+        return identifier in identifiers
+
+    return node, is_own
+
+
+def _resolve_border_router(call: ServiceCall, matter: MatterAdapter) -> MatterEndpoint:
+    """Return the border router endpoint of the chosen device."""
+    node, is_own = _resolve_device(call, matter)
+    endpoints = [e for e in get_border_router_endpoints(node) if is_own(e)]
+    if len(endpoints) != 1:
+        raise ServiceValidationError(
+            translation_domain=DOMAIN, translation_key="not_a_border_router"
+        )
+    return endpoints[0]
+
+
+async def _dataset_from_call(call: ServiceCall) -> bytes:
+    """Return the dataset of the call, by default the preferred network."""
+    if (dataset_hex := call.data.get(MatterServiceArgument.DATASET)) is None:
+        if (dataset_hex := await async_get_preferred_dataset(call.hass)) is None:
+            raise ServiceValidationError(
+                translation_domain=DOMAIN, translation_key="no_preferred_dataset"
+            )
+    try:
+        dataset = bytes.fromhex(dataset_hex)
+    except ValueError as err:
+        raise ServiceValidationError(
+            translation_domain=DOMAIN, translation_key="invalid_dataset"
+        ) from err
+    if not dataset:
+        raise ServiceValidationError(
+            translation_domain=DOMAIN, translation_key="invalid_dataset"
+        )
+    return dataset
+
+
+async def _async_push_thread_dataset(call: ServiceCall) -> None:
+    """Hand a dataset, by default the preferred network, to a border router."""
+    matter = _get_matter(call)
+    endpoint = _resolve_border_router(call, matter)
+    dataset = await _dataset_from_call(call)
+    await async_push_dataset(matter.matter_client, endpoint, dataset)
+
+
+async def _async_get_thread_dataset(call: ServiceCall) -> ServiceResponse:
+    """Return a border router's active dataset, and its pending one.
+
+    The datasets hold the network key, so only those whose timestamp says
+    they exist are read.
+    """
+    matter = _get_matter(call)
+    endpoint = _resolve_border_router(call, matter)
+    response: dict[str, Any] = {}
+    for kind, timestamp in (
+        ("active", get_active_dataset_timestamp(endpoint)),
+        ("pending", get_pending_dataset_timestamp(endpoint)),
+    ):
+        dataset = b""
+        if timestamp in (None, NullValue):
+            timestamp = None
+        else:
+            try:
+                dataset = await async_read_dataset(
+                    matter.matter_client, endpoint, pending=kind == "pending"
+                )
+            except (MatterError, MatterClientException) as err:
+                raise HomeAssistantError(
+                    translation_domain=DOMAIN,
+                    translation_key="thread_dataset_read_failed",
+                    translation_placeholders={
+                        "error": str(err) or err.__class__.__name__
+                    },
+                ) from err
+            except ValueError as err:
+                raise HomeAssistantError(
+                    translation_domain=DOMAIN,
+                    translation_key="thread_dataset_unusable",
+                ) from err
+        response[f"{kind}_dataset"] = dataset.hex() or None
+        response[f"{kind}_dataset_timestamp"] = timestamp
+    return response
+
+
 @callback
 def async_setup_services(hass: HomeAssistant) -> None:
     """Register the Matter services."""
@@ -64,6 +199,24 @@ def async_setup_services(hass: HomeAssistant) -> None:
                 probatio.Required(MatterServiceArgument.PASSWORD): cv.string,
             }
         ),
+    )
+    hass.services.async_register(
+        DOMAIN,
+        MatterService.PUSH_THREAD_DATASET,
+        _async_push_thread_dataset,
+        schema=probatio.Schema(
+            {
+                probatio.Required(ATTR_DEVICE_ID): cv.string,
+                probatio.Optional(MatterServiceArgument.DATASET): cv.string,
+            }
+        ),
+    )
+    hass.services.async_register(
+        DOMAIN,
+        MatterService.GET_THREAD_DATASET,
+        _async_get_thread_dataset,
+        schema=probatio.Schema({probatio.Required(ATTR_DEVICE_ID): cv.string}),
+        supports_response=SupportsResponse.ONLY,
     )
 
     service.async_register_platform_entity_service(

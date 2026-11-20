@@ -8,11 +8,13 @@ in step with its border routers.
 
 from base64 import b64decode
 from collections.abc import Callable
+import contextlib
 from dataclasses import dataclass
 from datetime import datetime
 from typing import TYPE_CHECKING, Any
 
 from chip.clusters import Objects as clusters
+from chip.clusters.Types import NullValue
 from matter_server.client.exceptions import MatterClientException
 from matter_server.client.models import device_types
 from matter_server.common.errors import MatterError, NodeNotExists
@@ -43,6 +45,8 @@ THREAD_DATASET_RETRY_DELAY = 30  # seconds
 THREAD_DATASET_READ_ATTEMPTS = 3
 # Once the quick attempts are used up
 THREAD_DATASET_SLOW_RETRY_DELAY = 900  # seconds
+# Fail-safe armed while an unprovisioned router is adopted
+ADOPTION_FAIL_SAFE_EXPIRY = 120  # seconds
 
 # Both device types carry the TBRM cluster.
 BORDER_ROUTER_DEVICE_TYPES = (
@@ -100,6 +104,14 @@ def get_active_dataset_timestamp(endpoint: MatterEndpoint) -> int | None:
     return timestamp
 
 
+def get_pending_dataset_timestamp(endpoint: MatterEndpoint) -> int | None:
+    """Return the pending dataset timestamp, set while a migration is scheduled."""
+    timestamp: int | None = endpoint.get_attribute_value(
+        None, clusters.ThreadBorderRouterManagement.Attributes.PendingDatasetTimestamp
+    )
+    return timestamp
+
+
 def get_extended_pan_id(endpoint: MatterEndpoint) -> str | None:
     """Return the router's extended PAN ID as hex, None when it reports none."""
     return _uint64_hex(
@@ -125,15 +137,91 @@ def _dataset_from_response(response: Any) -> bytes:
 
 
 async def async_read_dataset(
-    matter_client: MatterClient, endpoint: MatterEndpoint
+    matter_client: MatterClient, endpoint: MatterEndpoint, *, pending: bool = False
 ) -> bytes:
-    """Read the active dataset from a border router; empty when it has none."""
+    """Read the active or pending dataset from a border router; empty when it has none."""
+    commands = clusters.ThreadBorderRouterManagement.Commands
     response: Any = await matter_client.send_device_command(
         node_id=endpoint.node.node_id,
         endpoint_id=endpoint.endpoint_id,
-        command=clusters.ThreadBorderRouterManagement.Commands.GetActiveDatasetRequest(),
+        command=(
+            commands.GetPendingDatasetRequest()
+            if pending
+            else commands.GetActiveDatasetRequest()
+        ),
     )
     return _dataset_from_response(response)
+
+
+def check_commissioning_response(
+    response: Any, command: str, translation_key: str
+) -> None:
+    """Raise when ArmFailSafe or CommissioningComplete reports an error.
+
+    Both carry the error in the response, so a failed step reads as success
+    otherwise.
+    """
+    if isinstance(response, dict) and (code := response.get("errorCode")):
+        detail = f"{command} returned error {code} {response.get('debugText') or ''}"
+        raise HomeAssistantError(
+            translation_domain=DOMAIN,
+            translation_key=translation_key,
+            translation_placeholders={"error": detail.strip()},
+        )
+
+
+async def async_push_dataset(
+    matter_client: MatterClient, endpoint: MatterEndpoint, dataset: bytes
+) -> None:
+    """Hand a Thread network to a border router.
+
+    A router without a network is adopted under its fail-safe, disarmed again
+    if the write fails, so it ends provisioned or untouched. A router with a
+    network gets the dataset as pending, which Thread applies after its delay
+    timer.
+    """
+    commissioning = clusters.GeneralCommissioning.Commands
+    management = clusters.ThreadBorderRouterManagement.Commands
+
+    async def send(endpoint_id: int, command: Any) -> Any:
+        try:
+            return await matter_client.send_device_command(
+                node_id=endpoint.node.node_id,
+                endpoint_id=endpoint_id,
+                command=command,
+            )
+        except (MatterError, MatterClientException) as err:
+            raise HomeAssistantError(
+                translation_domain=DOMAIN,
+                translation_key="thread_dataset_push_failed",
+                translation_placeholders={"error": str(err) or err.__class__.__name__},
+            ) from err
+
+    if get_active_dataset_timestamp(endpoint) not in (None, NullValue):
+        await send(
+            endpoint.endpoint_id,
+            management.SetPendingDatasetRequest(pendingDataset=dataset),
+        )
+        return
+
+    response = await send(
+        0, commissioning.ArmFailSafe(expiryLengthSeconds=ADOPTION_FAIL_SAFE_EXPIRY)
+    )
+    check_commissioning_response(response, "ArmFailSafe", "thread_dataset_push_failed")
+    try:
+        await send(
+            endpoint.endpoint_id,
+            management.SetActiveDatasetRequest(activeDataset=dataset),
+        )
+    except HomeAssistantError:
+        # Reverts the router now rather than at expiry.
+        with contextlib.suppress(HomeAssistantError):
+            await send(0, commissioning.ArmFailSafe(expiryLengthSeconds=0))
+        raise
+    response = await send(0, commissioning.CommissioningComplete())
+    check_commissioning_response(
+        response, "CommissioningComplete", "thread_dataset_push_failed"
+    )
 
 
 async def async_ensure_thread_setup(hass: HomeAssistant) -> None:

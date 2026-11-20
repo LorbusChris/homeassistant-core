@@ -118,6 +118,9 @@
       "thermostat_remote_sensing_outdoor_temperature": {
         "name": "Outdoor temperature remote sensing"
       },
+      "thread_migration_pending": {
+        "name": "Thread migration pending"
+      },
       "valve_fault_blocked": {
         "name": "Valve blocked"
       },
@@ -135,6 +138,9 @@
       }
     },
     "button": {
+      "adopt_thread_network": {
+        "name": "Adopt preferred Thread network"
+      },
       "cancel_boost": {
         "name": "Cancel boost"
       },
@@ -872,14 +878,29 @@
     "invalid_credential_data": {
       "message": "Invalid credential data: {reason}."
     },
+    "invalid_dataset": {
+      "message": "The dataset must be Thread operational dataset TLVs in hex."
+    },
+    "invalid_device": {
+      "message": "Device {device_id} is not a Matter device."
+    },
     "matter_not_set_up": {
       "message": "The Matter integration is not set up."
+    },
+    "no_preferred_dataset": {
+      "message": "No dataset was given and there is no preferred Thread network."
+    },
+    "not_a_border_router": {
+      "message": "The selected device is not a Matter Thread border router."
     },
     "set_credential_failed": {
       "message": "Failed to set credential: lock returned status `{status}`."
     },
     "thread_dataset_not_newer": {
       "message": "Home Assistant already has a different Thread dataset with the same or a newer active timestamp for the network of this border router, so nothing was imported."
+    },
+    "thread_dataset_push_failed": {
+      "message": "Could not hand the Thread network to the border router: {error}."
     },
     "thread_dataset_read_failed": {
       "message": "Could not read the Thread dataset of the border router: {error}."
@@ -964,6 +985,16 @@
       "description": "Returns all users configured on a lock with their credentials.",
       "name": "Get lock users"
     },
+    "get_thread_dataset": {
+      "description": "Reads the active Thread dataset of a Matter border router, and the pending one while a migration is scheduled. The datasets contain the network key.",
+      "fields": {
+        "device_id": {
+          "description": "The Matter border router to read from.",
+          "name": "Border router"
+        }
+      },
+      "name": "Get Thread network from border router"
+    },
     "open_commissioning_window": {
       "description": "Allows adding one of your devices to another Matter network by opening the commissioning window for this Matter device for 60 seconds.",
       "fields": {
@@ -973,6 +1004,20 @@
         }
       },
       "name": "Open commissioning window"
+    },
+    "push_thread_dataset": {
+      "description": "Hands a Thread network to a Matter border router. A border router without a network is adopted into it; one with a network receives it as a pending migration.",
+      "fields": {
+        "dataset": {
+          "description": "Thread operational dataset as TLVs in hex. Defaults to the preferred network from the Thread settings.",
+          "name": "Dataset"
+        },
+        "device_id": {
+          "description": "The Matter border router to configure.",
+          "name": "Border router"
+        }
+      },
+      "name": "Push Thread network to border router"
     },
     "set_lock_credential": {
       "description": "Adds or updates a credential on a lock.",
