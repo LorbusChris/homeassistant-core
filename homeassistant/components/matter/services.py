@@ -27,6 +27,7 @@ from homeassistant.helpers import (
     device_registry as dr,
     service,
 )
+from homeassistant.util.json import JsonValueType
 
 from .adapter import MatterAdapter
 from .const import (
@@ -35,6 +36,7 @@ from .const import (
     CREDENTIAL_TYPE_REVERSE_MAP,
     DOMAIN,
     ID_TYPE_DEVICE_ID,
+    LOGGER,
     SERVICE_CREDENTIAL_TYPES,
     USER_TYPE_REVERSE_MAP,
     MatterService,
@@ -47,6 +49,14 @@ from .thread_border_router import (
     get_active_dataset_timestamp,
     get_border_router_endpoints,
     get_pending_dataset_timestamp,
+)
+from .thread_migration import (
+    MIGRATED,
+    async_migrate_device,
+    get_migration_order,
+    get_network_id,
+    get_thread_network_endpoint,
+    network_id_from_dataset,
 )
 
 
@@ -185,6 +195,89 @@ async def _async_get_thread_dataset(call: ServiceCall) -> ServiceResponse:
     return response
 
 
+def _resolve_thread_device(call: ServiceCall, matter: MatterAdapter) -> MatterEndpoint:
+    """Return the Thread network endpoint of the chosen device."""
+    node, is_own = _resolve_device(call, matter)
+    endpoint = get_thread_network_endpoint(node)
+    # A border router is the network, not a device on it.
+    if endpoint is None or get_border_router_endpoints(node) or not is_own(endpoint):
+        raise ServiceValidationError(
+            translation_domain=DOMAIN, translation_key="not_a_thread_device"
+        )
+    return endpoint
+
+
+async def _async_migrate_thread_device(call: ServiceCall) -> ServiceResponse:
+    """Move a Thread device onto a network, by default the preferred one."""
+    matter = _get_matter(call)
+    endpoint = _resolve_thread_device(call, matter)
+    dataset = await _dataset_from_call(call)
+    return {
+        "result": await async_migrate_device(matter.matter_client, endpoint, dataset)
+    }
+
+
+async def _async_migrate_thread_fleet(call: ServiceCall) -> ServiceResponse:
+    """Move every Thread device onto a network, by default the preferred one.
+
+    Devices already there are skipped and border routers left alone; end
+    devices go before the routers they depend on. Running it again picks up
+    the devices that failed, which fail the action unless its response is
+    asked for.
+    """
+    matter = _get_matter(call)
+    dataset = await _dataset_from_call(call)
+    target = network_id_from_dataset(dataset)
+    queue: list[tuple[int, int, MatterEndpoint]] = []
+    migrated: list[JsonValueType] = []
+    skipped: list[JsonValueType] = []
+    failed: list[dict[str, JsonValueType]] = []
+    for node in matter.matter_client.get_nodes():
+        node_id = node.node_id
+        endpoint = get_thread_network_endpoint(node)
+        if endpoint is None or get_border_router_endpoints(node):
+            continue
+        entry: dict[str, JsonValueType] = {"name": node.name, "node_id": node_id}
+        if get_network_id(endpoint) == target:
+            skipped.append(entry)
+        elif not node.available:
+            failed.append({**entry, "reason": "offline"})
+        else:
+            queue.append((get_migration_order(endpoint), node_id, endpoint))
+
+    queue.sort(key=lambda item: item[:2])
+    for index, (_, node_id, endpoint) in enumerate(queue, start=1):
+        entry = {"name": endpoint.node.name, "node_id": node_id}
+        LOGGER.debug(
+            "Moving node %s (%d of %d) to the Thread network",
+            node_id,
+            index,
+            len(queue),
+        )
+        try:
+            result = await async_migrate_device(matter.matter_client, endpoint, dataset)
+        except HomeAssistantError as err:
+            LOGGER.debug("Could not move node %s: %s", node_id, err)
+            failed.append({**entry, "reason": str(err)})
+        else:
+            (migrated if result == MIGRATED else skipped).append(entry)
+    if failed and not call.return_response:
+        raise HomeAssistantError(
+            translation_domain=DOMAIN,
+            translation_key="thread_migration_incomplete",
+            translation_placeholders={
+                "devices": ", ".join(
+                    str(entry["name"] or entry["node_id"]) for entry in failed
+                )
+            },
+        )
+    return {
+        "migrated": migrated,
+        "skipped": skipped,
+        "failed": cast(list[JsonValueType], failed),
+    }
+
+
 @callback
 def async_setup_services(hass: HomeAssistant) -> None:
     """Register the Matter services."""
@@ -217,6 +310,27 @@ def async_setup_services(hass: HomeAssistant) -> None:
         _async_get_thread_dataset,
         schema=probatio.Schema({probatio.Required(ATTR_DEVICE_ID): cv.string}),
         supports_response=SupportsResponse.ONLY,
+    )
+    hass.services.async_register(
+        DOMAIN,
+        MatterService.MIGRATE_THREAD_DEVICE,
+        _async_migrate_thread_device,
+        schema=probatio.Schema(
+            {
+                probatio.Required(ATTR_DEVICE_ID): cv.string,
+                probatio.Optional(MatterServiceArgument.DATASET): cv.string,
+            }
+        ),
+        supports_response=SupportsResponse.OPTIONAL,
+    )
+    hass.services.async_register(
+        DOMAIN,
+        MatterService.MIGRATE_THREAD_FLEET,
+        _async_migrate_thread_fleet,
+        schema=probatio.Schema(
+            {probatio.Optional(MatterServiceArgument.DATASET): cv.string}
+        ),
+        supports_response=SupportsResponse.OPTIONAL,
     )
 
     service.async_register_platform_entity_service(

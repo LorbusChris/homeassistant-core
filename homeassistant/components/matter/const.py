@@ -39,6 +39,8 @@ class MatterService(StrEnum):
     GET_LOCK_INFO = "get_lock_info"
     GET_LOCK_USERS = "get_lock_users"
     GET_THREAD_DATASET = "get_thread_dataset"
+    MIGRATE_THREAD_DEVICE = "migrate_thread_device"
+    MIGRATE_THREAD_FLEET = "migrate_thread_fleet"
     PUSH_THREAD_DATASET = "push_thread_dataset"
     SET_LOCK_CREDENTIAL = "set_lock_credential"
     SET_LOCK_USER = "set_lock_user"
